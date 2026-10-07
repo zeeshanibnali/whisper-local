@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Whisper Local — Insights</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b0c0e; --panel:#15171b; --line:#292c32; --ink:#f5f7fa; --muted:#9aa1ac; --green:#8ee6b0; --teal:#77d8d1; --orange:#ffbc77; --radius:20px; }
+    * { box-sizing:border-box } body { margin:0; font:15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:radial-gradient(700px 400px at 80% -10%, #153329 0%, transparent 62%), var(--bg); }
+    main { width:min(1180px, calc(100% - 40px)); margin:0 auto; padding:52px 0 70px; }
+    header { display:flex; align-items:flex-start; justify-content:space-between; gap:22px; margin-bottom:34px; } h1 { font-size:clamp(30px,5vw,46px); letter-spacing:-.055em; line-height:1; margin:0 0 10px; } h1 span { color:var(--green) } .eyebrow,.meta { color:var(--muted); font-size:13px; } .eyebrow { text-transform:uppercase; letter-spacing:.13em; font-weight:700; }
+    .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; } button,.file-label,select { border:1px solid var(--line); border-radius:12px; background:#202329; color:var(--ink); padding:10px 13px; font:inherit; cursor:pointer; } .file-label { background:var(--green); border-color:var(--green); color:#082012; font-weight:750; } input[type=file] { display:none } select { cursor:pointer; } button:hover,.file-label:hover,select:hover { border-color:#737b88; }
+    .drop { border:1px dashed #4f5660; border-radius:var(--radius); background:rgba(21,23,27,.8); padding:42px; text-align:center; margin-bottom:22px; transition:.15s; } .drop.drag { border-color:var(--green); background:#10231a; } .drop strong { display:block; font-size:18px; margin-bottom:7px; } code { background:#252931; padding:2px 5px; border-radius:5px; color:#d8dce2; }
+    .dashboard { display:none; } .cards { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:14px; } .card,.panel { background:rgba(21,23,27,.9); border:1px solid var(--line); border-radius:var(--radius); } .card { padding:20px; min-height:138px; display:flex; flex-direction:column; justify-content:space-between; } .card .label { color:var(--muted); font-size:13px; } .card .value { font-size:32px; letter-spacing:-.055em; font-weight:750; line-height:1; } .card .note { color:var(--teal); font-size:12px; margin-top:9px; }
+    .grid { display:grid; grid-template-columns:1.6fr 1fr; gap:14px; } .panel { padding:22px; } .panel h2 { font-size:16px; letter-spacing:-.025em; margin:0; } .panel-head { display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin-bottom:19px; } .chart { height:255px; position:relative; } svg { width:100%; height:100%; overflow:visible; } .axis { color:var(--muted); font-size:11px; display:flex; justify-content:space-between; margin-top:8px; gap:8px; } .apps { display:grid; gap:14px; } .app-row { display:grid; grid-template-columns:minmax(90px,1fr) 3fr auto; align-items:center; gap:9px; font-size:13px; } .app-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#d8dce2; } .bar { height:8px; border-radius:99px; overflow:hidden; background:#292c32; } .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--teal),var(--green)); border-radius:99px; }
+    .insights { margin-top:14px; display:grid; grid-template-columns:repeat(3,1fr); gap:14px; } .insight { padding:19px; } .insight strong { display:block; font-size:19px; letter-spacing:-.035em; margin-bottom:5px; } .insight p { color:var(--muted); margin:0; font-size:13px; } .empty { padding:60px 16px; text-align:center; color:var(--muted); } .privacy { margin-top:24px; color:var(--muted); font-size:12px; text-align:center; }
+    @media (max-width:800px) { main { width:min(100% - 24px,1180px); padding-top:28px } header { display:block } .controls { margin-top:20px } .cards { grid-template-columns:repeat(2,1fr) } .grid,.insights { grid-template-columns:1fr } .chart { height:210px } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><div class="eyebrow">Whisper Local · private insights</div><h1>Your voice, <span>measured.</span></h1><div class="meta" id="subtitle">Load your local stats to see the story behind your dictation.</div></div>
+      <div class="controls"><select id="range" aria-label="Date range"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option><option value="0">All time</option></select><label class="file-label" for="file">Load stats.jsonl</label><input id="file" type="file" accept=".jsonl,.txt,application/json"></div>
+    </header>
+    <section id="drop" class="drop"><strong>Drop your <code>stats.jsonl</code> here</strong><span class="meta">Find it at <code>~/.whisperkey/stats.jsonl</code>. It never leaves this browser.</span></section>
+    <section id="dashboard" class="dashboard">
+      <div class="cards">
+        <article class="card"><span class="label">Words dictated</span><strong class="value" id="words">—</strong><span class="note" id="wordsNote">—</span></article>
+        <article class="card"><span class="label">Time saved</span><strong class="value" id="saved">—</strong><span class="note">vs typing at 40 WPM</span></article>
+        <article class="card"><span class="label">Dictation sessions</span><strong class="value" id="sessions">—</strong><span class="note" id="sessionsNote">—</span></article>
+        <article class="card"><span class="label">Voice velocity</span><strong class="value" id="velocity">—</strong><span class="note" id="velocityNote">—</span></article>
+      </div>
+      <div class="grid">
+        <section class="panel"><div class="panel-head"><h2>Words by day</h2><span class="meta" id="trendMeta"></span></div><div class="chart"><svg id="chart" viewBox="0 0 800 240" preserveAspectRatio="none"></svg></div><div class="axis" id="axis"></div></section>
+        <section class="panel"><div class="panel-head"><h2>Where you dictate</h2><span class="meta">by session</span></div><div class="apps" id="apps"></div></section>
+      </div>
+      <div class="insights">
+        <section class="panel insight"><strong id="streak">—</strong><p>active-day streak</p></section>
+        <section class="panel insight"><strong id="bestDay">—</strong><p>strongest dictation day</p></section>
+        <section class="panel insight"><strong id="weekCompare">—</strong><p>this week compared with last</p></section>
+      </div>
+    </section>
+    <p class="privacy">This single-file dashboard runs entirely on your Mac. It reads only the metadata in <code>stats.jsonl</code>—never transcript content—and makes no network requests.</p>
+  </main>
+  <script>
+    const WORD_CHARS = 5, TYPING_WPM = 40;
+    let all = [];
+    const $ = id => document.getElementById(id);
+    const num = n => new Intl.NumberFormat().format(Math.round(n));
+    const mins = n => n < 60 ? `${Math.round(n)} min` : `${(n/60).toFixed(n >= 600 ? 0 : 1)} hr`;
+    const day = ts => (ts || '').slice(0,10);
+    const date = s => new Date(`${s}T12:00:00`);
+    function parse(text) { return text.split(/\r?\n/).map(line => { try { return JSON.parse(line) } catch { return null } }).filter(x => x && x.ts && Number(x.chars) > 0); }
+    function load(file) { const reader = new FileReader(); reader.onload = e => { all = parse(e.target.result).sort((a,b) => String(a.ts).localeCompare(String(b.ts))); render(); }; reader.readAsText(file); }
+    function sum(list, key) { return list.reduce((n,x) => n + (+x[key] || 0), 0); }
+    function render() {
+      if (!all.length) return;
+      $('drop').style.display='none'; $('dashboard').style.display='block';
+      const range = +$('range').value, last = date(day(all.at(-1).ts)), start = range ? new Date(last - (range - 1) * 86400000) : null;
+      const entries = start ? all.filter(x => date(day(x.ts)) >= start) : all;
+      const chars=sum(entries,'chars'), words=Math.floor(chars/WORD_CHARS), seconds=sum(entries,'duration_s'), saved=Math.max(0,words/TYPING_WPM-seconds/60), wpm=seconds ? words/(seconds/60) : 0;
+      $('words').textContent=num(words); $('wordsNote').textContent=`${num(chars)} characters delivered`; $('saved').textContent=mins(saved); $('sessions').textContent=num(entries.length); $('sessionsNote').textContent=`${new Set(entries.map(x=>day(x.ts))).size} active days`; $('velocity').textContent=`${num(wpm)} WPM`; $('velocityNote').textContent=`${mins(seconds/60)} spent speaking`;
+      $('subtitle').textContent=`${entries.length} dictations from ${day(entries[0].ts)} to ${day(entries.at(-1).ts)} · all kept locally`;
+      chart(entries, start, last, range); apps(entries); insights();
+    }
+    function chart(entries,start,last,range) {
+      const dates=[]; if (range) for(let d=new Date(start);d<=last;d.setDate(d.getDate()+1)) dates.push(d.toISOString().slice(0,10)); else dates.push(...[...new Set(entries.map(x=>day(x.ts)))]);
+      const values=dates.map(d=>Math.floor(sum(entries.filter(x=>day(x.ts)===d),'chars')/WORD_CHARS)); const max=Math.max(...values,1), w=800, h=240, pad=8;
+      const points=values.map((v,i)=>[dates.length===1?w/2:i*(w/(dates.length-1)), h-pad-(v/max)*(h-2*pad)]);
+      const line=points.map(p=>p.join(',')).join(' '); const fill=`${points[0][0]},${h} ${line} ${points.at(-1)[0]},${h}`;
+      $('chart').innerHTML=`<defs><linearGradient id="fill" x1="0" x2="0" y1="0" y2="1"><stop stop-color="#8ee6b0" stop-opacity=".42"/><stop offset="1" stop-color="#8ee6b0" stop-opacity="0"/></linearGradient></defs><line x1="0" y1="${h-pad}" x2="${w}" y2="${h-pad}" stroke="#30343b"/><polygon points="${fill}" fill="url(#fill)"/><polyline points="${line}" fill="none" stroke="#8ee6b0" stroke-width="3" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>${points.map(p=>`<circle cx="${p[0]}" cy="${p[1]}" r="3" fill="#0b0c0e" stroke="#8ee6b0" stroke-width="2" vector-effect="non-scaling-stroke"/>`).join('')}`;
+      const label = d => new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric'}).format(date(d)); const ticks=[0,Math.floor((dates.length-1)/2),dates.length-1]; $('axis').innerHTML=[...new Set(ticks)].map(i=>`<span>${label(dates[i])}</span>`).join(''); $('trendMeta').textContent=`Peak: ${num(max)} words`;
+    }
+    function apps(entries) { const counts={}; entries.forEach(x=>{const n=(x.app||'Unknown').replace(/^com\./,'').replace(/\./g,' · ');counts[n]=(counts[n]||0)+1}); const rows=Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,6), max=rows[0]?.[1]||1; $('apps').innerHTML=rows.map(([name,n])=>`<div class="app-row"><span class="app-name" title="${name}">${name}</span><span class="bar"><i style="width:${100*n/max}%"></i></span><span>${num(n)}</span></div>`).join('') || '<div class="empty">No app data yet.</div>'; }
+    function insights() { const days=[...new Set(all.map(x=>day(x.ts)))].sort(), today=day(all.at(-1).ts); let streak=1, cursor=date(today); while(days.includes(new Date(cursor-86400000).toISOString().slice(0,10))){streak++;cursor=new Date(cursor-86400000)}; const totals=Object.fromEntries(days.map(d=>[d,Math.floor(sum(all.filter(x=>day(x.ts)===d),'chars')/WORD_CHARS)])); const best=days.reduce((a,b)=>totals[a]>totals[b]?a:b); const last=date(today), thisWeek=sum(all.filter(x=>date(day(x.ts))>=new Date(last-6*86400000)),'chars')/WORD_CHARS, prior=sum(all.filter(x=>date(day(x.ts))>=new Date(last-13*86400000)&&date(day(x.ts))<new Date(last-6*86400000)),'chars')/WORD_CHARS; $('streak').textContent=`${streak} day${streak===1?'':'s'}`; $('bestDay').textContent=`${num(totals[best])} words`; $('bestDay').nextElementSibling.textContent=`strongest day · ${new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric'}).format(date(best))}`; const diff=thisWeek-prior; $('weekCompare').textContent=`${diff>=0?'+':''}${num(diff)} words`; }
+    $('file').addEventListener('change',e=>e.target.files[0]&&load(e.target.files[0])); $('range').addEventListener('change',render); ['dragover','dragenter'].forEach(t=>$('drop').addEventListener(t,e=>{e.preventDefault();$('drop').classList.add('drag')})); ['dragleave','drop'].forEach(t=>$('drop').addEventListener(t,e=>{e.preventDefault();$('drop').classList.remove('drag')})); $('drop').addEventListener('drop',e=>e.dataTransfer.files[0]&&load(e.dataTransfer.files[0]));
+  </script>
+</body>
+</html>
