@@ -31,7 +31,10 @@ def _build_settings_header():
         "\n"
     )
 
-EXTENSIBLE_PATHS = {'whisper.models', 'streaming.models'}
+# Maps whose entries are the user's own (not defined in the defaults), so a
+# settings save must keep every entry rather than drop unknown keys.
+EXTENSIBLE_PATHS = {'whisper.models', 'streaming.models',
+                    'postprocess.styles', 'postprocess.corrections'}
 
 def deep_merge_config(default_config: Dict[str, Any],
                       user_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -279,7 +282,13 @@ class ConfigManager:
         recording_hotkey = beautify_hotkey(self.config['hotkey']['recording_hotkey'])
         recording_mode = self.config['hotkey'].get('recording_mode', 'toggle')
         mode_hint = " (hold to record)" if recording_mode == "push_to_talk" else ""
+        if recording_mode == "push_to_talk" and self.config['hotkey'].get('double_tap_to_lock'):
+            mode_hint = " (hold to record, double-tap for hands-free)"
         print(f"   [{recording_hotkey}] for transcription{mode_hint}")
+
+        paste_last = self.config['hotkey'].get('paste_last_hotkey')
+        if paste_last:
+            print(f"   [{beautify_hotkey(paste_last)}] to paste your last dictation again")
 
         if self.get_voice_commands_config().get('enabled', True):
             command_hotkey = self.config['hotkey'].get('command_hotkey')

@@ -1,10 +1,11 @@
 # text_postprocess.py
 # The text-shaping stage between Whisper and delivery. Runs an ordered pipeline
-# over the raw transcript: spoken editing commands ("scratch that") → inline
-# voice formatting (say "comma") → deterministic smart formatting (times/emails/
-# URLs) → user corrections → filler/casing/punctuation tidying → optional Ollama
-# polish. Every stage is opt-in via the `postprocess` config section and pure
-# except the final Ollama call, so output stays predictable and fully offline.
+# over the raw transcript: spoken editing ("scratch that", "actually 3") →
+# inline voice formatting (say "comma") → deterministic smart formatting
+# (times/emails/URLs) → user corrections → fillers, lists, style → snippets →
+# casing/punctuation tidying → optional Ollama polish. Every stage is opt-in via
+# the `postprocess` config section and pure except the final Ollama call, so
+# output stays predictable and fully offline.
 
 import functools
 import json
@@ -12,6 +13,10 @@ import logging
 import re
 import urllib.error
 import urllib.request
+
+from . import dictation_cleanup
+from .snippets import expand_snippets
+from .styles import resolve_style
 
 logger = logging.getLogger(__name__)
 
@@ -40,16 +45,42 @@ INLINE_FORMAT_REPLACEMENTS = [
 ]
 
 
+# A toggle's on/off value. ruamel reads YAML 1.2, where `no` / `off` are
+# strings, and bool("no") is True, so a hand-written `list_formatting: no`
+# would switch the feature ON. Only real true values and yes/on/true count.
+def _on(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ('true', 'yes', 'on', '1')
+    return value is True or (isinstance(value, int) and not isinstance(value, bool) and value != 0)
+
+
 def postprocess(text: str, config: dict) -> str:
     if not text or not config:
         return text
 
+    # A named style is shorthand for a set of the toggles below. The app-rule
+    # path resolves it beforehand (see app_rules.effective_postprocess_config)
+    # and drops the key; this covers every other caller.
+    if config.get('style'):
+        config = {**config, **resolve_style(config['style'], config)}
+
     # Spoken editing commands ("scratch that") operate on the raw dictation flow,
     # so they run first — before any symbol/format rewriting.
-    if config.get('voice_editing', False):
+    if _on(config.get('voice_editing')):
         text = _apply_voice_editing(text)
 
-    if config.get('inline_formatting', False):
+    # "at 2, actually 3" → "at 3". Same raw-flow reasoning as voice editing.
+    backtrack_cfg = config.get('backtrack')
+    if isinstance(backtrack_cfg, dict) and _on(backtrack_cfg.get('enabled')):
+        cues = backtrack_cfg.get('cues') or dictation_cleanup.DEFAULT_BACKTRACK_CUES
+        if isinstance(cues, str):
+            cues = [cues]
+        text = dictation_cleanup.apply_backtrack(text, cues)
+
+    if _on(config.get('remove_repeated_words')):
+        text = dictation_cleanup.remove_repeated_words(text)
+
+    if _on(config.get('inline_formatting')):
         text = _apply_inline_formatting(text, config)
 
     # Deterministic, offline symbol formatting (times / emails / URLs). Each
@@ -74,27 +105,59 @@ def postprocess(text: str, config: dict) -> str:
     if isinstance(replacements, (list, tuple)) and replacements:
         text = _apply_replacements(text, replacements)
 
-    if config.get('strip_filler_words', False):
+    if _on(config.get('strip_filler_words')):
         text = _strip_fillers(text)
 
-    if config.get('strip_trailing_period', False):
+    became_list = False
+    if _on(config.get('list_formatting')):
+        before = text
+        text = dictation_cleanup.apply_list_formatting(
+            text, style=str(config.get('list_style', 'numbered')))
+        became_list = text != before
+
+    # Before snippets, so a style never lowercases a snippet's expansion; the
+    # user's corrected terms keep their casing too.
+    if _on(config.get('lowercase')):
+        text = dictation_cleanup.apply_lowercase(text, _protected_terms(config))
+
+    # A dictation that was only a snippet trigger is delivered exactly as the
+    # snippet is written: no casing or punctuation tidying, no LLM polish.
+    text, whole_snippet = expand_snippets(text, config.get('snippets'))
+    if whole_snippet:
+        return text
+
+    if _on(config.get('strip_trailing_period')):
         text = _strip_trailing_period(text)
 
-    if config.get('capitalize_first', False):
+    if _on(config.get('capitalize_first')):
         text = _capitalize_first(text)
 
-    if config.get('ensure_punctuation', False):
+    # A list's last item takes no closing period.
+    if _on(config.get('ensure_punctuation')) and not became_list:
         text = _ensure_punctuation(text)
 
     # Same defensive shape check as smart_formatting above — a malformed
     # `ollama:` value must degrade to "no polish", not raise mid-dictation.
     ollama_cfg = config.get('ollama')
-    if isinstance(ollama_cfg, dict) and ollama_cfg.get('enabled', False):
+    if isinstance(ollama_cfg, dict) and _on(ollama_cfg.get('enabled')):
         polished = _ollama_polish(text, ollama_cfg)
         if polished:
             text = polished
 
     return text
+
+
+# Terms the user has taught the app (corrections and replacement targets),
+# whose casing the lowercase style must leave alone.
+def _protected_terms(config: dict) -> list:
+    terms = []
+    corrections = config.get('corrections')
+    if isinstance(corrections, dict):
+        terms.extend(str(k) for k in corrections)
+    for item in config.get('replacements') or ():
+        if isinstance(item, dict) and item.get('to'):
+            terms.extend(str(item['to']).split())
+    return terms
 
 
 def _strip_trailing_period(text: str) -> str:
@@ -298,7 +361,6 @@ def _apply_smart_formatting(text: str, cfg: dict) -> str:
 # the longer variant must win, otherwise the shorter one shadows it and leaves a
 # dangling "x". Matching is case-insensitive; the replacement is inserted with
 # the exact casing the user wrote.
-# (Design adopted from upstream PinW/whisper-key-local @59d6eb7.)
 @functools.lru_cache(maxsize=8)
 def _compile_corrections(items: tuple):
     lookup = {}
@@ -375,14 +437,25 @@ def _apply_replacements(text: str, items: list) -> str:
     return text
 
 
+# Remove filler words without touching layout. Both the trailing run and the
+# whitespace collapse are restricted to spaces and tabs ([ \t]), never \s:
+# \s matches newlines, so the old version ate the line and paragraph breaks
+# that inline formatting had just inserted — "like\n\nBravo" lost its
+# paragraph, and any surviving \n\n was then collapsed to a single space by
+# the \s{2,} pass (issue #9). Structural whitespace is someone else's output,
+# and this filter has no business rewriting it.
 def _strip_fillers(text: str) -> str:
     pattern = re.compile(
-        r'\b(um|uh|erm|uhm|like|you know)\b[,]?\s*',
+        r'\b(um|uh|erm|uhm|like|you know)\b[,]?[ \t]*',
         flags=re.IGNORECASE,
     )
     cleaned = pattern.sub('', text)
-    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
-    return cleaned or text
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    # A filler removed at the start of a line leaves the indent behind; drop
+    # spaces that now sit against a break, but keep the break itself.
+    cleaned = re.sub(r'[ \t]+(\r?\n)', r'\1', cleaned)
+    cleaned = re.sub(r'(\r?\n)[ \t]+', r'\1', cleaned)
+    return cleaned.strip() or text
 
 
 def _capitalize_first(text: str) -> str:

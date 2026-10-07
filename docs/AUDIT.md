@@ -1,10 +1,185 @@
 # Whisper Local — Code Audit & Improvement Backlog
 
-**Last updated:** 2026-08-24
+**Last updated:** 2026-09-28
 **Audited versions:** 0.10.0 (Round 1, below) and 0.11.x (Round 2, next section)
 **Method:** Parallel subsystem reviews + manual verification of every finding before fixing.
 
 > This is a living document. Each issue has a stable ID (e.g. `SRV-1`) so commits and PRs can reference it. When you fix one, change its **Status** to `FIXED (<commit>)` rather than deleting it, so history stays readable.
+
+---
+
+## Round 13 (0.21.0) — the defaults that never updated (2026-09)
+
+Found while checking whether 0.20.0's app-rule reordering actually reached
+anyone. It hadn't. `app_rules.py`, `voice_commands.py`, `transforms.py` and
+`profiles.py` each copied their shipped defaults into the user's config folder
+once, on first launch, and read only that copy afterwards. So every improvement
+to a shipped file landed for new installs and for nobody else.
+
+Measured on the maintainer's own machine, seeded 7 May:
+
+| file | shipped | theirs |
+|---|---|---|
+| `app_rules.yaml` | 5 | 4 |
+| `commands.yaml` | 21 | 19 |
+| `profiles.yaml` | 5 | 4 |
+| `transforms.yaml` | 6 | 6 |
+
+Eleven releases of drift, including the fix for a code editor showing
+`slack_bot.py` matching the chat rule and auto-sending.
+
+The fix follows the split config already used (`config.defaults.yaml` ships the
+base, `user_settings.yaml` holds overrides): `defaults_merge.py` loads the
+shipped entries from the package on every start and layers the user's file over
+them. Shipped app rules carry a stable `id`; commands, transforms and profiles
+keep the identity they already had (`trigger`, `name`, the mapping key) rather
+than growing a parallel naming scheme.
+
+Decisions worth recording:
+- **User entries are matched before shipped ones.** For app rules first match
+  wins, so anything someone wrote themselves has to outrank the defaults.
+- **A key the user left out is not an override.** Their file predates the key,
+  so it keeps following the shipped entry. This is what lets the new `style:`
+  values reach an old file.
+- **An edited match list re-binds to the shipped rule it overlaps most.**
+  Caught during review: editing a rule's `match` changes its identity, so the
+  migration saw a brand-new rule and the shipped one loaded behind it. Someone
+  who removed Discord from the chat rule would have had Discord auto-sending
+  again, silently. The override now replaces the shipped list.
+- **A null action clears the one a shipped command came with.** The merge keeps
+  the shipped `hotkey` key, so `_execute_action` had to test values rather than
+  key presence; it was dispatching cleared actions.
+- **`--doctor` reports effective totals**, since counting an overrides-only file
+  would have told people they had 0 rules while five were in force.
+
+The original file is backed up to `<name>.yaml.<date>.bak` before the one-time
+rewrite. 19 tests in `LayeredDefaultsTests`; 282 pass.
+
+## Round 12 (0.20.0) — Wispr Flow–style features (2026-09)
+
+Gap analysis against Wispr Flow's shipped features (Command Mode, Styles,
+Snippets, Backtrack, hands-free, paste-last, whisper mode, …). Built only what
+works fully offline and can be tested without a desktop: `dictation_cleanup.py`
+(backtrack, stutters, spoken lists, lowercase), `snippets.py`, `styles.py`,
+`hotkey_gestures.py` (double-tap lock), and `audio_gain.py` (whisper mode),
+plus a paste-last hotkey.
+
+Design constraints carried over from earlier rounds:
+- **Every text pass is O(n).** Two earlier regex passes froze the pipeline for
+  about 7 s on long dictations, so the new passes use find-then-expand scans
+  and have a large-input timing test.
+- **Nothing rewrites prose on a guess.** Backtrack needs a typed value after
+  the cue, lists need markers counting up from one plus punctuation, and
+  lowercase leaves acronyms, mixed case and the user's corrections alone.
+- **Style resolution happens once** (`app_rules.effective_postprocess_config`),
+  so the global style can't override an app rule's.
+- **Paste-last fires on key release** and waits for physical modifiers
+  (`keyboard.modifiers_held()`, new and mirrored), because a synthetic Ctrl+V
+  while Alt+Shift is held arrives as Ctrl+Alt+Shift+V.
+
+A pre-release adversarial review found, and this round fixed:
+- a blocker: paste-last never fired on macOS, whose backend only reports
+  releases for modifier-only chords (it now fires on press and waits for the
+  modifiers);
+- custom `styles`/`corrections` being dropped on any settings save (now in
+  `EXTENSIBLE_PATHS`);
+- backtrack treating the "." in "2.5" as a sentence end, matching "am" inside
+  "amazing", and rewriting prose after a cue ("3 movies, actually one of
+  them…"): a correction now needs the value to end the phrase or repeat the
+  words it replaces;
+- stutter removal merging "you, you're" and clause-spanning repeats;
+- the default stop key (part of the record chord) breaking the double-tap
+  lock;
+- paste-last ignoring `suppress`/copy-only app rules;
+- whisper mode boosting before the silence trims;
+- hand-edited non-mapping sections crashing the Settings window;
+- YAML `no` switching toggles on.
+All pinned in `ReleaseReviewFixTests`.
+
+Real hotkey feel (double-tap timing, paste-last) and the macOS Tk preload with
+the menu-bar loop still need a hands-on test on Windows and macOS; the state
+machine and wiring are unit-tested with fakes. Settings round trip and all
+Tk windows verified with real Tk under Xvfb.
+
+---
+
+## Round 11 (0.20.0) — user-reported issues (2026-09)
+
+Both open issues. Each came with a diagnosis and a patch on a fork. The root
+causes were confirmed against our own code and the fixes written here. Neither
+fork was merged.
+
+- **ISS-14 (Critical, macOS app unusable)** Whoever calls `sharedApplication()`
+  first decides NSApp's class. pyobjc did, so Tk 9's drawing code sent
+  `TKApplication`-only selectors to a plain `NSApplication` and the process
+  aborted (an `NSException`, invisible to Python). Tk now creates the app first
+  via a hidden root kept alive in `platform/macos/app.py`. Added the mirrored
+  `TK_MAIN_THREAD_ONLY` constant and `utils.tk_requires_main_thread()`: the
+  overlay stands down on macOS, and the welcome window runs inline on the main
+  thread with a `quit()`-then-`destroy()` teardown and shutdown-event polling.
+  The teardown trap was reproduced with real Tk under Xvfb: with a second root
+  alive on the thread, the 0.19.0 `destroy()`-only close hangs `mainloop()`, and
+  the new one returns.
+  **This amends the multi-Tk-root decision below.** "Each root on its own daemon
+  thread" holds on Windows only. On macOS a Tk window must be created on the
+  main thread. The fallback window, cheat sheet and add-word dialog now open
+  in a child process there (`window_launcher.py`, hidden `--window NAME` flag,
+  payload over stdin so a transcript never lands in argv), and the `--history`
+  / `--cheat-sheet` CLI windows run on the main thread. All four were built
+  with real Tk on the main thread under Xvfb.
+- **ISS-15 (High, GPU dictation hangs)** `_test_ct2_gpu` only proved the NVIDIA
+  driver answers, so onboarding enabled CUDA with no cuBLAS/cuDNN on disk. It now
+  loads the five libraries ctranslate2 4.x pulls in on first inference, using
+  `winmode=0` so the probe searches exactly as ctranslate2 does, PATH included.
+  pip's `nvidia-*-cu12` DLL folders are registered at startup (`add_dll_directory`
+  for Python-side loads, PATH for native `LoadLibrary`). A CUDA engine now fails
+  fast into the existing GPU-recovery prompt instead of hanging. That prompt no
+  longer waits for a key on windowless launches, and `--doctor` gained a CUDA
+  libraries check. Not verifiable on real hardware from here, so the probe and
+  path logic are covered with faked loaders.
+
+212 tests pass (21 new).
+
+---
+
+## Round 10 (0.19.0) — user-reported issues (2026-09)
+
+Five issues from users running 0.18.3. Every root cause was reproduced locally
+before any fix; two turned out to be more interesting than the report suggested.
+
+- **ISS-13 (Critical, app unusable)** macOS 27 made off-main-thread AppKit access
+  a hard `SIGTRAP` instead of a logged warning, so the first hotkey press killed
+  the process. Ten tray writes were reached from worker threads — the recording
+  thread and a level monitor rewriting the title every 150 ms. `SIGTRAP` is not a
+  Python exception, so the existing per-write `try`/`except` was decorative.
+  Added `run_on_ui_thread()` to the platform layer (main-queue dispatch on macOS,
+  passthrough on Windows) and routed every tray mutation through it; menus are
+  still BUILT off-thread and only ASSIGNED on it. +3 tests, one of which scans
+  the source for unguarded writes so a new one fails CI.
+- **ISS-9 (High, silent data mangling)** `_strip_fillers` used `\s` in both its
+  trailing run and its whitespace collapse, so enabling filler stripping deleted
+  the line and paragraph breaks inline formatting had just inserted. Narrowed
+  both to `[ \t]`. +3 tests, including one asserting output is identical with
+  stripping on and off apart from the fillers.
+- **ISS-10 (High, feature entirely broken)** `--history` and `--cheat-sheet`
+  spawned their window on a daemon thread, slept 0.5 s and exited, killing it.
+  The launchers now return the thread and the CLI joins it. Verified by
+  subprocess: alive past 3 s where it previously died at 0.5 s.
+- **ISS-12 (Med, privacy)** The clipboard-free setting was honoured on delivery
+  but not on the two recovery paths. Fixed via a single
+  `ClipboardManager.silent_copy_allowed` policy. Note the nuance: those copies
+  were the reason a suppressed or undeliverable transcript was not lost, so the
+  fix routes such cases to the recovery window instead of silently dropping the
+  safety net. An explicit Copy button is always still allowed.
+- **ISS-11 (Not a bug, real UX failure)** "Fails to transcribe in VS Code" was
+  the shipped copy-only code-editor rule working correctly — @Syncriix diagnosed
+  it from the log. But the app said nothing, so the only available conclusion was
+  that it was broken. Now announced once per rule per session, with a pointer to
+  `app_rules.yaml`; the settings label and config comment no longer imply the
+  global toggle is the final word. Worth remembering: a correct behaviour nobody
+  can discover is still a defect.
+
+187 tests pass; `--doctor` green.
 
 ---
 
@@ -34,25 +209,17 @@ was reproduced locally before fixing rather than taken on trust.
   degrades to current behaviour instead of losing hotkeys. **Not verified on real
   macOS hardware by us** — the contributor validated it on their machine.
 
-**Not adopted:** upstream's two open issues are feature requests (Linux X11
-hotkeys, VAD); VAD already exists here.
-
 **Process note:** two contributors report being unable to open PRs against this
 repo. No interaction limits are set and forking is enabled — the cause is that
-this repo is itself a fork, so GitHub defaults a PR's base to the root parent
-(PinW/whisper-key-local). Worth resolving; there is a finished Intel GPU
+this repo is itself a fork, so GitHub defaults a PR's base to the root parent. Worth resolving; there is a finished Intel GPU
 (OpenVINO) backend waiting on it in discussion #5.
 
 ---
 
-## Round 8 (0.18.0) — merge from upstream (2026-08)
+## Round 8 (0.18.0) — merged improvements (2026-08)
 
-PR [PinW/whisper-key-local#64](https://github.com/PinW/whisper-key-local/pull/64)
-was closed unmerged ("too messy to merge" — it was an undescribed bulk diff, so
-that verdict was about the shape of the PR, not the code). Divergence still had
-to be resolved, so this round goes the other way: review all 16 upstream commits
-since the fork point (af0e8b1) and adopt what is genuinely better, without
-surrendering anything this fork added.
+Reviewed 16 outside commits since af0e8b1 and adopted what is genuinely better,
+without surrendering anything already here.
 
 **Adopted:**
 - **UP-1 (Bug, real hardware)** `_classify_gpu` matched a single digit after
@@ -60,7 +227,7 @@ surrendering anything this fork added.
   app offered a runtime that cannot drive it. It also required a literal space,
   missing the "RX5700" form vendors emit, and had no pattern for Strix Halo /
   Ryzen AI MAX APUs (8040S/8050S/8060S), so GPU onboarding never fired on that
-  hardware. Adopted upstream's four-digit match. +8-case test.
+  hardware. Adopted a four-digit match. +8-case test.
 - **UP-2 (Feature)** Startup "ready" chime (`audio_feedback.ready_enabled`) plus
   the `app_ready.wav` asset. A cold start is slow and the app has no window; an
   audible cue is the clearest "the hotkey is live now" signal.
@@ -82,10 +249,10 @@ surrendering anything this fork added.
   remains what the history window's "Fix this everywhere" writes; `corrections`
   runs first so a specific replacement can still override a broad mapping.
 
-**Already present, no action:** push-to-talk for the command hotkey
-(upstream ad890a4), `strip_trailing_period` (6cbdc32).
+**Already present, no action:** push-to-talk for the command hotkey,
+`strip_trailing_period`.
 
-**Deliberately not taken:** upstream's CLAUDE.md trim and the replacement of
+**Deliberately not taken:** a CLAUDE.md trim and the replacement of
 `project-index.md` with a condensed map (this fork's docs are richer and are
 enforced by `DocumentationStandardTests`), their plan-doc removal, and the 0.8.2
 version bump.

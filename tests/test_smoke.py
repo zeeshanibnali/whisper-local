@@ -4,7 +4,78 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+LF = chr(10)  # newline, for readable assertions about layout
 sys.path.insert(0, str(ROOT / "src"))
+
+
+# ── Faking the platform layer ─────────────────────────────────────────────────
+# whisper_key.platform imports the OS backend (pyobjc / pywin32 / PIL), which
+# the lean CI env doesn't install, so a test that needs a module importing it
+# swaps in a stand-in for the WHOLE package. Faking only a submodule is not
+# enough: `from .platform import app` still runs the real package __init__.
+# The real platform modules are never evicted either. On macOS, re-running
+# platform/macos/app.py redefines an Objective-C class, which pyobjc refuses.
+_PLATFORM_SUBMODULES = ('hotkeys', 'keyboard', 'foreground', 'app', 'console',
+                        'permissions', 'icons', 'paths', 'instance_lock', 'gpu')
+
+
+# A module whose every attribute is a MagicMock unless set explicitly.
+def _stand_in_module(name):
+    import types
+    import unittest.mock as mock
+
+    class StandIn(types.ModuleType):
+        __path__ = []
+
+        def __getattr__(self, attr):
+            if attr.startswith('__'):
+                raise AttributeError(attr)
+            value = mock.MagicMock(name=f'{self.__name__}.{attr}')
+            setattr(self, attr, value)
+            return value
+    return StandIn(name)
+
+
+# sys.modules entries for a stand-in platform package. `app_attrs` are set on
+# the fake platform.app (TK_MAIN_THREAD_ONLY defaults to False).
+def fake_platform_modules(**app_attrs) -> dict:
+    modules = {f'whisper_key.platform.{m}': _stand_in_module(f'whisper_key.platform.{m}')
+               for m in _PLATFORM_SUBMODULES}
+    package = _stand_in_module('whisper_key.platform')
+    package.IS_MACOS = package.IS_WINDOWS = False
+    package.PLATFORM = 'unsupported'
+    for m in _PLATFORM_SUBMODULES:
+        setattr(package, m, modules[f'whisper_key.platform.{m}'])
+    app = modules['whisper_key.platform.app']
+    app.TK_MAIN_THREAD_ONLY = False
+    for key, value in app_attrs.items():
+        setattr(app, key, value)
+    modules['whisper_key.platform'] = package
+    return modules
+
+
+# For the rest of `test`: patch sys.modules with `fakes` and drop the app's own
+# modules so they re-import against them. Everything (including the attributes
+# the re-imports bind on the whisper_key package) is restored afterwards, so
+# nothing faked leaks into later tests.
+def reimport_under(test, fakes: dict):
+    import unittest.mock as mock
+    import whisper_key
+    saved_attrs = dict(vars(whisper_key))
+    patcher = mock.patch.dict(sys.modules, fakes)
+    patcher.start()
+
+    def restore():
+        patcher.stop()
+        for key in [k for k in vars(whisper_key) if k not in saved_attrs]:
+            delattr(whisper_key, key)
+        for key, value in saved_attrs.items():
+            setattr(whisper_key, key, value)
+    test.addCleanup(restore)
+    for name in [n for n in sys.modules
+                 if n.startswith('whisper_key.') and n not in fakes
+                 and not n.startswith('whisper_key.platform') and n != 'whisper_key.utils']:
+        sys.modules.pop(name)
 
 
 class HotkeyParsingTests(unittest.TestCase):
@@ -466,9 +537,16 @@ class TransformsShapeTests(unittest.TestCase):
             self.assertIn('prompt', t)
 
     def test_transforms_manager_loads(self):
-        from whisper_key.transforms import TransformsManager
-        tm = TransformsManager()
-        names = [t.get('name') for t in tm.list_transforms()]
+        # Against a throwaway config dir, never the developer's own: the
+        # manager writes to it now (it seeds and migrates transforms.yaml),
+        # and a test has no business touching a real install.
+        import tempfile
+        import unittest.mock as mock
+        import whisper_key.transforms as tr
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tr, 'get_user_app_data_path', return_value=tmp):
+                manager = tr.TransformsManager()
+            names = [t.get('name') for t in manager.list_transforms()]
         self.assertIn('polish', names)
         self.assertIn('prompt-engineer', names)
 
@@ -1588,11 +1666,11 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class UpstreamMergeTests(unittest.TestCase):
-    """Features adopted from upstream PinW/whisper-key-local, pinned here so a
+class MergedFeatureTests(unittest.TestCase):
+    """Features merged in 0.18.0, pinned here so a
     future refactor can't quietly drop them."""
 
-    # --- AMD GPU classification (upstream 86ce94f) ---
+    # --- AMD GPU classification ---
     def test_amd_gpu_classification(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location(
@@ -1616,7 +1694,7 @@ class UpstreamMergeTests(unittest.TestCase):
             self.assertEqual(gpu._classify_gpu('amd', name), expected, f"for {name!r}")
         self.assertEqual(gpu._classify_gpu('nvidia', 'GeForce RTX 4090'), 'nvidia')
 
-    # --- Vocabulary corrections (upstream 59d6eb7, adapted) ---
+    # --- Vocabulary corrections ---
     def test_corrections_map_many_variants_to_one_term(self):
         from whisper_key.text_postprocess import postprocess
         cfg = {'corrections': {'CAPEX': ['cap x', 'copics'], 'MySQL': ['my sequel']}}
@@ -1651,7 +1729,7 @@ class UpstreamMergeTests(unittest.TestCase):
                'replacements': [{'from': 'budget', 'to': 'spend'}]}
         self.assertEqual(postprocess('the cap x budget', cfg), 'the CAPEX spend')
 
-    # --- Terminal tab title (upstream 892403b, retitled) ---
+    # --- Terminal tab title ---
     def test_terminal_title_parses_static_and_animated_states(self):
         from whisper_key.terminal_title import TerminalTitle
         t = TerminalTitle({'idle': '', 'recording': [['R', 0.1], ['  ', 0.2]],
@@ -1675,7 +1753,7 @@ class UpstreamMergeTests(unittest.TestCase):
         t.start()
         t.stop()  # must not raise even when disabled
 
-    # --- Startup ready sound (upstream d1d507a) ---
+    # --- Startup ready sound ---
     def test_ready_sound_wired_and_asset_present(self):
         import inspect
         # The asset must ship regardless of whether the audio backend is
@@ -2084,3 +2162,1360 @@ class UninstallSafetyTests(unittest.TestCase):
                 rc = uninstall.run_uninstall()
         self.assertEqual(rc, 0)
         self.assertIn('already clean', buf.getvalue())
+
+
+class UserReportedSeptemberTests(unittest.TestCase):
+    """Issues #9-#13, reported by users running 0.18.3."""
+
+    # --- #9: filler stripping destroyed inline-formatting newlines ---
+    def _fmt_cfg(self, **extra):
+        cfg = {'inline_formatting': True, 'inline_formatting_absorb_punctuation': True,
+               'inline_formatting_replacements': [
+                   {'phrase': 'period', 'replacement': '. '},
+                   {'phrase': 'new line', 'replacement': LF},
+                   {'phrase': 'new paragraph', 'replacement': LF + LF}]}
+        cfg.update(extra)
+        return cfg
+
+    def test_filler_stripping_preserves_line_structure(self):
+        from whisper_key.text_postprocess import postprocess
+        text = 'alpha like period new paragraph bravo new line charlie'
+        without = postprocess(text, self._fmt_cfg(strip_filler_words=False))
+        with_strip = postprocess(text, self._fmt_cfg(strip_filler_words=True))
+        # The ONLY difference may be the filler word itself.
+        self.assertEqual(without.replace(' like', ''), with_strip)
+        self.assertIn(LF + LF, with_strip, 'paragraph break must survive (issue #9)')
+
+    def test_filler_stripping_still_removes_fillers(self):
+        from whisper_key.text_postprocess import postprocess
+        got = postprocess('um hello uh there you know friend', {'strip_filler_words': True})
+        for filler in ('um ', 'uh ', 'you know'):
+            self.assertNotIn(filler, got)
+        self.assertIn('hello', got)
+
+    def test_filler_stripping_does_not_collapse_paragraphs(self):
+        # The second half of the bug: even newlines that survived the filler
+        # pattern were flattened by a blanket whitespace collapse.
+        from whisper_key.text_postprocess import postprocess
+        self.assertEqual(postprocess('one' + LF + LF + 'two', {'strip_filler_words': True}),
+                         'one' + LF + LF + 'two')
+        # Runs of plain spaces SHOULD still collapse.
+        self.assertEqual(postprocess('one    two', {'strip_filler_words': True}), 'one two')
+
+    # --- #10: --history killed its own window ---
+    def test_window_launchers_return_their_thread(self):
+        # main.py waits on this thread. Returning None again would restore the
+        # bug: the window lives on a daemon thread and sys.exit kills it.
+        import inspect
+        for module, func in (('history_window', 'show_history'),
+                             ('cheat_sheet', 'show_cheat_sheet')):
+            try:
+                mod = __import__('whisper_key.' + module, fromlist=[func])
+            except Exception:
+                self.skipTest(module + ' not importable on this platform')
+            source = inspect.getsource(getattr(mod, func))
+            self.assertIn('return thread', source,
+                          func + ' must return its thread so the CLI can join it (issue #10)')
+
+    def test_history_cli_joins_instead_of_sleeping(self):
+        source = (ROOT / 'src' / 'whisper_key' / 'main.py').read_text(encoding='utf-8')
+        block = source[source.index('if args.history:'):source.index('if args.enable_autostart:')]
+        self.assertIn('.join()', block)
+        self.assertNotIn('time.sleep(0.5)', block,
+                         'sleeping then exiting kills the daemon window (issue #10)')
+
+    # --- #12: clipboard-free dictation leaked to the clipboard ---
+    def _clipboard(self, method, also_copy):
+        # clipboard_manager pulls the platform keyboard backend and PIL,
+        # neither of which the lean CI env installs.
+        try:
+            from whisper_key.clipboard_manager import ClipboardManager
+        except Exception:
+            self.skipTest('clipboard_manager not importable in this env')
+        c = ClipboardManager.__new__(ClipboardManager)
+        c.delivery_method = method
+        c.type_also_copy_to_clipboard = also_copy
+        return c
+
+    def test_silent_copy_policy(self):
+        self.assertFalse(self._clipboard('type', False).silent_copy_allowed,
+                         'clipboard-free dictation must stay clipboard-free (issue #12)')
+        self.assertTrue(self._clipboard('type', True).silent_copy_allowed)
+        # Paste delivery needs the clipboard by definition.
+        self.assertTrue(self._clipboard('paste', False).silent_copy_allowed)
+
+    def test_fallback_window_respects_clipboard_policy(self):
+        import inspect
+        from whisper_key import fallback_window
+        params = inspect.signature(fallback_window.FallbackWindow.show).parameters
+        self.assertIn('allow_clipboard', params)
+        body = inspect.getsource(fallback_window.FallbackWindow._run_window)
+        self.assertIn('if allow_clipboard:', body,
+                      'the popup must not auto-copy when copying is off')
+        # The explicit Copy button stays unconditional - that is the user asking.
+        self.assertIn('def _copy_again', body)
+
+    def test_recovery_paths_check_the_policy(self):
+        source = (ROOT / 'src' / 'whisper_key' / 'state_manager.py').read_text(encoding='utf-8')
+        self.assertEqual(source.count('silent_copy_allowed'), 2,
+                         'both recovery paths (suppress + no-text-field) must check it')
+
+    # --- #11: an app rule silencing paste looked like a broken app ---
+    def test_copy_only_is_announced_once_per_rule(self):
+        import unittest.mock as mock
+        try:
+            from whisper_key.state_manager import StateManager
+        except Exception:
+            self.skipTest('state_manager not importable on this platform')
+        sm = StateManager.__new__(StateManager)
+        sm.logger = __import__('logging').getLogger('test')
+        sm.system_tray = mock.Mock()
+        rule = {'match': ['code.exe', 'cursor.exe'], 'auto_paste': False}
+        sm._announce_copy_only(rule)
+        sm._announce_copy_only(rule)                    # same rule again
+        sm._announce_copy_only({'match': ['slack.exe']})
+        self.assertEqual(sm.system_tray.notify.call_count, 2,
+                         'once per rule, not once per dictation')
+        said = sm.system_tray.notify.call_args_list[0].args[0]
+        self.assertIn('code.exe', said)
+        self.assertIn('app_rules.yaml', said, 'tell them where to change it')
+
+    # --- #13: macOS 27 SIGTRAP from off-main-thread tray writes ---
+    def test_platform_exposes_ui_thread_marshal(self):
+        # Importing the platform package loads the OS backend (win32api /
+        # AppKit), which the lean CI env doesn't install.
+        try:
+            from whisper_key.platform import app as platform_app
+        except Exception:
+            self.skipTest('platform backend not importable in this env')
+        self.assertTrue(hasattr(platform_app, 'run_on_ui_thread'))
+        ran = []
+        platform_app.run_on_ui_thread(lambda: ran.append(1))
+        self.assertEqual(ran, [1], 'must actually run the callable')
+
+    def test_no_unguarded_tray_writes_remain(self):
+        # Every AppKit-touching write must go through _on_ui_thread. A direct
+        # assignment from a worker thread is an instant SIGTRAP on macOS 27.
+        import re
+        source = (ROOT / 'src' / 'whisper_key' / 'system_tray.py').read_text(encoding='utf-8')
+        offenders = []
+        for i, line in enumerate(source.splitlines(), 1):
+            stripped = line.strip()
+            if re.match(r'^self[.]icon[.](icon|menu|title)\s*=', stripped):
+                offenders.append(str(i) + ': ' + stripped)
+            if stripped.startswith('self.icon.notify(') and '_on_ui_thread' not in line:
+                offenders.append(str(i) + ': ' + stripped)
+        self.assertEqual(offenders, [],
+                         'tray writes must be marshalled to the UI thread (issue #13)')
+
+    def test_macos_marshal_uses_main_queue(self):
+        source = (ROOT / 'src' / 'whisper_key' / 'platform' / 'macos' / 'app.py').read_text(encoding='utf-8')
+        self.assertIn('NSThread.isMainThread()', source, 'fast path when already on main')
+        self.assertIn('mainQueue', source, 'must dispatch to the main queue')
+
+
+class UserReportedLateSeptemberTests(unittest.TestCase):
+    """Issues #14 and #15, reported by users running 0.19.0."""
+
+    # Load a platform backend file directly, so it can be exercised on any OS
+    # with its OS-only dependencies faked out.
+    def _load(self, relative_path, name):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            name, str(ROOT / 'src' / 'whisper_key' / relative_path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    # --- #15: pip-installed CUDA libraries were on no DLL search path ---
+    def test_nvidia_dll_dirs_are_found_in_site_packages(self):
+        import tempfile
+        from whisper_key.utils import find_nvidia_dll_dirs
+        with tempfile.TemporaryDirectory() as root:
+            for lib in ('cublas', 'cudnn', 'cuda_runtime'):
+                (Path(root) / 'nvidia' / lib / 'bin').mkdir(parents=True)
+            (Path(root) / 'nvidia' / 'cudnn' / 'include').mkdir()
+            found = find_nvidia_dll_dirs([root, root])  # duplicate root on purpose
+        names = sorted(Path(d).parent.name for d in found)
+        self.assertEqual(names, ['cublas', 'cuda_runtime', 'cudnn'], 'each bin dir exactly once')
+
+    def test_nvidia_dll_path_registers_both_loaders_on_windows(self):
+        import unittest.mock as mock
+        from whisper_key import utils
+        dirs = [os.path.join('sp', 'nvidia', 'cublas', 'bin'),
+                os.path.join('sp', 'nvidia', 'cudnn', 'bin')]
+        added = []
+        with mock.patch.object(utils.sys, 'platform', 'win32'), \
+             mock.patch.object(utils, 'find_nvidia_dll_dirs', return_value=dirs), \
+             mock.patch.object(utils.os, 'add_dll_directory', added.append, create=True), \
+             mock.patch.dict(os.environ, {'PATH': 'existing'}):
+            utils.setup_nvidia_dll_path()
+            utils.setup_nvidia_dll_path()  # idempotent: no PATH growth
+            path_parts = os.environ['PATH'].split(os.pathsep)
+        # add_dll_directory serves ctypes/extension loads; PATH serves the plain
+        # LoadLibrary calls ctranslate2 and cuDNN make. Both are needed.
+        self.assertEqual(added[:2], dirs)
+        self.assertEqual(path_parts, dirs + ['existing'])
+
+    def test_nvidia_dll_path_is_a_no_op_off_windows(self):
+        import unittest.mock as mock
+        from whisper_key import utils
+        with mock.patch.object(utils.sys, 'platform', 'darwin'), \
+             mock.patch.object(utils, 'find_nvidia_dll_dirs') as finder:
+            utils.setup_nvidia_dll_path()
+        finder.assert_not_called()
+
+    def test_dll_path_is_set_up_before_the_ml_stack_imports(self):
+        source = (ROOT / 'src' / 'whisper_key' / 'main.py').read_text(encoding='utf-8')
+        self.assertLess(source.index('setup_nvidia_dll_path()'),
+                        source.index('from .whisper_engine import'))
+
+    def _gpu_probe(self, loadable, compute_types=('float16',)):
+        import types
+        import unittest.mock as mock
+        gpu = self._load('platform/windows/gpu.py', 'wk_gpu_probe')
+
+        def win_dll(name, winmode=None):
+            # winmode=0 means the plain LoadLibrary search (PATH included),
+            # which is what ctranslate2 itself uses.
+            self.assertEqual(winmode, 0)
+            if name not in loadable:
+                raise OSError(f'{name} not found')
+        gpu.ctypes = types.SimpleNamespace(WinDLL=win_dll)
+        ct2 = types.ModuleType('ctranslate2')
+        ct2.get_supported_compute_types = lambda device: list(compute_types)
+        patcher = mock.patch.dict(sys.modules, {'ctranslate2': ct2})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return gpu
+
+    def test_gpu_probe_fails_without_cublas_and_cudnn(self):
+        import io
+        import contextlib
+        # The reported machine: driver present, no cuBLAS/cuDNN anywhere. The
+        # probe used to pass here and onboarding switched the app to CUDA.
+        gpu = self._gpu_probe(loadable=())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertFalse(gpu._test_ct2_gpu('cuda'))
+        self.assertIn('cublas64_12.dll', out.getvalue(), 'name what is missing')
+
+    def test_gpu_probe_passes_when_every_library_loads(self):
+        gpu = self._gpu_probe(loadable=('cublas64_12.dll', 'cublasLt64_12.dll', 'cudnn64_9.dll',
+                                        'cudnn_ops64_9.dll', 'cudnn_cnn64_9.dll'))
+        self.assertTrue(gpu._test_ct2_gpu('cuda'))
+        self.assertEqual(gpu._missing_cuda_libraries(), [])
+
+    def test_gpu_probe_reports_a_single_missing_cudnn_part(self):
+        gpu = self._gpu_probe(loadable=('cublas64_12.dll', 'cublasLt64_12.dll',
+                                        'cudnn64_9.dll', 'cudnn_ops64_9.dll'))
+        self.assertEqual(gpu._missing_cuda_libraries(), ['cudnn_cnn64_9.dll'])
+
+    def test_rocm_builds_are_not_held_to_nvidia_libraries(self):
+        import unittest.mock as mock
+        gpu = self._gpu_probe(loadable=())
+        self.assertTrue(gpu._test_ct2_gpu('rocm'))
+        with mock.patch.object(gpu, '_detect_ct2_variant', return_value='rocm'):
+            self.assertEqual(gpu.missing_gpu_libraries(), [])
+        with mock.patch.object(gpu, '_detect_ct2_variant', return_value='cuda'):
+            self.assertIn('cudnn64_9.dll', gpu.missing_gpu_libraries())
+
+    def test_macos_gpu_mirror_has_the_same_api(self):
+        mac = self._load('platform/macos/gpu.py', 'wk_gpu_mac')
+        self.assertEqual(mac.missing_gpu_libraries(), [])
+
+    # whisper_engine imports numpy, which refuses a second import per process.
+    # Import it BEFORE patch.dict snapshots sys.modules so the restore keeps it.
+    def _preload_numpy(self):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest('numpy not installed')
+
+    def _fake_hardware_detection(self, missing):
+        import types
+        fake = types.ModuleType('whisper_key.hardware_detection')
+        fake.missing_gpu_libraries = lambda: list(missing)
+        return fake
+
+    def test_cuda_engine_fails_fast_instead_of_hanging(self):
+        # Existing configs already say device: cuda. With the libraries absent the
+        # model loads, then the first dictation hangs; the engine must refuse up
+        # front so main's GPU-failure path can offer setup or CPU.
+        self._preload_numpy()
+        import contextlib
+        import io
+        import types
+        import unittest.mock as mock
+        fake_fw = types.ModuleType('faster_whisper')
+        fake_fw.WhisperModel = mock.Mock(name='WhisperModel')
+        with mock.patch.dict(sys.modules, {
+                'faster_whisper': fake_fw,
+                'whisper_key.hardware_detection': self._fake_hardware_detection(['cudnn_ops64_9.dll'])}):
+            sys.modules.pop('whisper_key.whisper_engine', None)
+            from whisper_key.whisper_engine import WhisperEngine
+            # The engine prints emoji progress lines; main() switches stdout to
+            # UTF-8 first, but a cp1252 test console (Windows CI) would choke.
+            with self.assertRaises(RuntimeError) as ctx, contextlib.redirect_stdout(io.StringIO()):
+                WhisperEngine(model_key='base', device='cuda', compute_type='float16')
+            fake_fw.WhisperModel.assert_not_called()
+        self.assertIn('cudnn_ops64_9.dll', str(ctx.exception))
+
+    def test_cpu_engine_skips_the_gpu_check(self):
+        self._preload_numpy()
+        import contextlib
+        import io
+        import types
+        import unittest.mock as mock
+        fake_fw = types.ModuleType('faster_whisper')
+        fake_fw.WhisperModel = mock.Mock(name='WhisperModel')
+        with mock.patch.dict(sys.modules, {
+                'faster_whisper': fake_fw,
+                'whisper_key.hardware_detection': self._fake_hardware_detection(['cublas64_12.dll'])}):
+            sys.modules.pop('whisper_key.whisper_engine', None)
+            from whisper_key.whisper_engine import WhisperEngine
+            with contextlib.redirect_stdout(io.StringIO()):  # emoji vs a cp1252 console
+                WhisperEngine(model_key='base', device='cpu', compute_type='int8')
+            fake_fw.WhisperModel.assert_called_once()
+
+    def test_gpu_recovery_prompt_is_skipped_without_a_console(self):
+        # The fail-fast check above lands in this prompt. Under pythonw/autostart
+        # nobody can answer it, so it must fall back to CPU rather than wait.
+        import types
+        import io
+        import contextlib
+        import unittest.mock as mock
+        reimport_under(self, fake_platform_modules(getch=lambda: self.fail('must not wait for a keypress')))
+        from whisper_key import onboarding
+        with mock.patch.object(onboarding.sys, 'stdin', None), \
+             mock.patch.object(onboarding, 'prompt_choice') as prompt, \
+             contextlib.redirect_stdout(io.StringIO()):
+            onboarding.handle_gpu_failure(RuntimeError('CUDA libraries not found'), mock.Mock())
+        prompt.assert_not_called()
+
+    def test_doctor_flags_missing_cuda_libraries(self):
+        import io
+        import contextlib
+        import unittest.mock as mock
+        from whisper_key import doctor
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with mock.patch.dict(sys.modules, {
+                    'whisper_key.hardware_detection': self._fake_hardware_detection(['cublas64_12.dll'])}):
+                self.assertEqual(doctor._check_gpu_libraries(), 1)
+            with mock.patch.dict(sys.modules, {
+                    'whisper_key.hardware_detection': self._fake_hardware_detection([])}):
+                self.assertEqual(doctor._check_gpu_libraries(), 0)
+        self.assertIn('cublas64_12.dll', out.getvalue())
+
+    # --- #14: macOS abort (exit 134) from Tk vs pyobjc's NSApplication ---
+    def test_platform_app_mirrors_declare_the_tk_constraint(self):
+        import re
+        for plat, expected in (('macos', 'True'), ('windows', 'False')):
+            source = (ROOT / 'src' / 'whisper_key' / 'platform' / plat / 'app.py').read_text(encoding='utf-8')
+            self.assertRegex(source, r'(?m)^TK_MAIN_THREAD_ONLY = ' + re.escape(expected) + '$',
+                             plat + ' app.py must declare TK_MAIN_THREAD_ONLY (mirrored API)')
+
+    def test_tk_constraint_helper(self):
+        import unittest.mock as mock
+        from whisper_key.utils import tk_requires_main_thread
+        for constraint in (True, False):
+            with mock.patch.dict(sys.modules, fake_platform_modules(TK_MAIN_THREAD_ONLY=constraint)):
+                self.assertIs(tk_requires_main_thread(), constraint)
+
+    def test_macos_setup_lets_tk_create_the_shared_application(self):
+        # Whoever calls sharedApplication() first decides NSApp's class. Tk must
+        # win, or its drawing code sends TKApplication-only selectors to a plain
+        # NSApplication and the process aborts.
+        import types
+        import unittest.mock as mock
+        order = []
+
+        class FakeNSObject:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+        class FakeNSApp:
+            def setActivationPolicy_(self, policy):
+                pass
+
+            def setDelegate_(self, delegate):
+                pass
+
+        class FakeNSApplication:
+            @staticmethod
+            def sharedApplication():
+                order.append('sharedApplication')
+                return FakeNSApp()
+
+        class FakeTk:
+            def __init__(self):
+                order.append('tk.Tk')
+
+            def withdraw(self):
+                pass
+
+        appkit = types.ModuleType('AppKit')
+        appkit.NSApplication = FakeNSApplication
+        appkit.NSApplicationActivationPolicyAccessory = 1
+        appkit.NSEventMaskAny = 0
+        appkit.NSDefaultRunLoopMode = 'default'
+        foundation = types.ModuleType('Foundation')
+        foundation.NSDate = foundation.NSOperationQueue = foundation.NSThread = mock.Mock()
+        foundation.NSObject = FakeNSObject
+        tkinter = types.ModuleType('tkinter')
+        tkinter.Tk = FakeTk
+        with mock.patch.dict(sys.modules, {'AppKit': appkit, 'Foundation': foundation, 'tkinter': tkinter}):
+            mac_app = self._load('platform/macos/app.py', 'wk_mac_app')
+            mac_app.setup()
+        self.assertEqual(order, ['tk.Tk', 'sharedApplication'])
+        self.assertIsNotNone(mac_app._tk_preload_root, 'the hidden root must stay alive')
+
+    def test_overlay_stands_down_where_tk_is_main_thread_only(self):
+        import unittest.mock as mock
+        from whisper_key.level_overlay import LevelOverlay
+        overlay = LevelOverlay(level_provider=lambda: 0.0)
+        overlay._available = True  # as if tkinter were importable
+        with mock.patch('whisper_key.utils.tk_requires_main_thread', return_value=True), \
+             mock.patch('whisper_key.level_overlay.threading.Thread') as thread:
+            overlay.start()
+        thread.assert_not_called()
+        self.assertFalse(overlay._available, 'every later overlay call must be a no-op')
+        overlay.show_recording()
+        overlay.flash_failure('still safe')
+
+    def test_welcome_runs_inline_on_macos_and_threaded_elsewhere(self):
+        import threading
+        import unittest.mock as mock
+        from whisper_key import first_run
+        seen = []
+        done = threading.Event()
+
+        def fake_run(on_close, hotkey_label, shutdown_event):
+            seen.append(threading.current_thread() is threading.main_thread())
+            done.set()
+        event = threading.Event()
+        with mock.patch.object(first_run, '_run_welcome', fake_run):
+            with mock.patch('whisper_key.utils.tk_requires_main_thread', return_value=True):
+                first_run.show_welcome_window(shutdown_event=event)
+            with mock.patch('whisper_key.utils.tk_requires_main_thread', return_value=False):
+                done.clear()
+                first_run.show_welcome_window(shutdown_event=event)
+                self.assertTrue(done.wait(2))
+        self.assertEqual(seen, [True, False])
+
+    # A just-enough tkinter for the welcome window. mainloop() models the real
+    # one: it only returns once quit() has been called, because with the macOS
+    # preload root alive, destroy() alone never ends it.
+    def _run_welcome_with_fake_tk(self, drive, shutdown_event=None):
+        import types
+        import unittest.mock as mock
+        calls = []
+
+        class Widget:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: None
+
+        class BooleanVar(Widget):
+            def get(self):
+                return False
+
+        class Tk(Widget):
+            def __init__(self):
+                self.after_callbacks = []
+                self.close_handler = None
+
+            def protocol(self, name, handler):
+                self.close_handler = handler
+
+            def after(self, ms, callback):
+                self.after_callbacks.append(callback)
+
+            def quit(self):
+                calls.append('quit')
+
+            def destroy(self):
+                calls.append('destroy')
+
+            def mainloop(self):
+                calls.append('mainloop')
+                drive(self)
+                if 'quit' not in calls:
+                    raise AssertionError('mainloop() would never return: quit() was not called')
+                calls.append('mainloop returned')
+
+        tkinter = types.ModuleType('tkinter')
+        tkinter.Tk = Tk
+        tkinter.Frame = tkinter.Label = tkinter.Button = tkinter.Checkbutton = Widget
+        tkinter.BooleanVar = BooleanVar
+        on_close = mock.Mock()
+        from whisper_key import first_run
+        with mock.patch.dict(sys.modules, {'tkinter': tkinter}), \
+             mock.patch.object(first_run, 'mark_first_run_complete') as mark:
+            first_run._run_welcome(on_close, 'CTRL+WIN', shutdown_event)
+        return calls, on_close, mark
+
+    def test_welcome_dismissal_quits_before_destroying(self):
+        calls, on_close, mark = self._run_welcome_with_fake_tk(lambda root: root.close_handler())
+        self.assertEqual(calls, ['mainloop', 'quit', 'mainloop returned', 'destroy'])
+        mark.assert_called_once()
+        on_close.assert_called_once()
+
+    def test_welcome_closes_on_shutdown_without_counting_as_dismissed(self):
+        import threading
+        event = threading.Event()
+
+        def drive(root):
+            event.set()  # SIGTERM arrives while the window is open
+            for callback in list(root.after_callbacks):
+                callback()
+        calls, on_close, mark = self._run_welcome_with_fake_tk(drive, shutdown_event=event)
+        self.assertIn('quit', calls)
+        self.assertEqual(calls[-1], 'destroy')
+        mark.assert_not_called()
+        on_close.assert_not_called()
+
+    def test_main_hands_the_welcome_window_the_shutdown_event(self):
+        source = (ROOT / 'src' / 'whisper_key' / 'main.py').read_text(encoding='utf-8')
+        call = source[source.index('show_welcome_window('):]
+        call = call[:call.index(')\n')]
+        self.assertIn('shutdown_event=shutdown_event', call)
+
+    # --- #14 follow-through: every other Tk window on macOS ---
+    def test_windows_stay_in_process_where_tk_threads_are_fine(self):
+        import unittest.mock as mock
+        from whisper_key import window_launcher
+        with mock.patch('whisper_key.utils.tk_requires_main_thread', return_value=False), \
+             mock.patch.object(window_launcher.subprocess, 'Popen') as popen:
+            self.assertFalse(window_launcher.open_in_child_process('cheat-sheet'))
+        popen.assert_not_called()
+
+    def test_macos_windows_open_in_a_child_with_the_payload_on_stdin(self):
+        import json
+        import unittest.mock as mock
+        from whisper_key import window_launcher
+        child = mock.Mock()
+        with mock.patch('whisper_key.utils.tk_requires_main_thread', return_value=True), \
+             mock.patch.object(window_launcher.subprocess, 'Popen', return_value=child) as popen, \
+             mock.patch.object(window_launcher.threading, 'Thread'):
+            handled = window_launcher.open_in_child_process('fallback', {'transcript': 'secret words'})
+        self.assertTrue(handled)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-2:], ['--window', 'fallback'])
+        self.assertNotIn('secret words', ' '.join(command), 'transcripts must not go in argv')
+        sent = json.loads(child.stdin.write.call_args.args[0].decode('utf-8'))
+        self.assertEqual(sent['transcript'], 'secret words')
+        child.stdin.close.assert_called_once()
+
+    def test_failed_spawn_never_falls_back_to_in_process_tk(self):
+        import unittest.mock as mock
+        from whisper_key import window_launcher
+        with mock.patch('whisper_key.utils.tk_requires_main_thread', return_value=True), \
+             mock.patch.object(window_launcher.subprocess, 'Popen', side_effect=OSError('nope')):
+            self.assertTrue(window_launcher.open_in_child_process('add-word'))
+
+    def test_child_runs_each_window_blocking_on_its_main_thread(self):
+        import io
+        import unittest.mock as mock
+        from whisper_key import window_launcher
+        for name, target in (('cheat-sheet', 'whisper_key.cheat_sheet.show_cheat_sheet'),
+                             ('add-word', 'whisper_key.dictionary.show_add_word_dialog'),
+                             ('history', 'whisper_key.history_window.show_history')):
+            with mock.patch(target) as show:
+                self.assertEqual(window_launcher.run_window(name, io.StringIO('')), 0)
+            self.assertTrue(show.call_args.kwargs.get('blocking'), name + ' must run blocking')
+        with mock.patch('whisper_key.fallback_window.FallbackWindow._run_window') as run:
+            code = window_launcher.run_window(
+                'fallback', io.StringIO('{"transcript": "hi", "reason": "r", "allow_clipboard": false}'))
+        self.assertEqual(code, 0)
+        run.assert_called_once_with('hi', 'r', False)
+        self.assertEqual(window_launcher.run_window('fallback', io.StringIO('not json')), 1)
+
+    def test_fallback_window_hands_off_instead_of_threading(self):
+        import unittest.mock as mock
+        from whisper_key.fallback_window import FallbackWindow
+        window = FallbackWindow()
+        window._available = True
+        with mock.patch('whisper_key.window_launcher.open_in_child_process', return_value=True) as launch, \
+             mock.patch('whisper_key.fallback_window.threading.Thread') as thread:
+            window.show('dictated text', allow_clipboard=False)
+        thread.assert_not_called()
+        payload = launch.call_args.args[1]
+        self.assertEqual(payload['transcript'], 'dictated text')
+        self.assertFalse(payload['allow_clipboard'])
+        self.assertTrue(payload['reason'], 'the default reason must travel with it')
+
+    def test_window_flag_choices_match_the_launcher(self):
+        from whisper_key.window_launcher import WINDOW_NAMES
+        source = (ROOT / 'src' / 'whisper_key' / 'main.py').read_text(encoding='utf-8')
+        line = source[source.index("'--window'"):]
+        line = line[:line.index('\n')]
+        for name in WINDOW_NAMES:
+            self.assertIn(repr(name), line)
+
+
+class WisprStyleFeatureTests(unittest.TestCase):
+    """Wispr Flow–style editing added in 0.20.0: backtrack, stutters, spoken
+    lists, styles, snippets, paste-last, double-tap lock, whisper mode."""
+
+    # --- Backtrack ---
+    def test_backtrack_replaces_the_value_it_corrects(self):
+        from whisper_key.dictation_cleanup import apply_backtrack
+        cases = {
+            "Let's meet at 2, actually 3 tomorrow.": "Let's meet at 3 tomorrow.",
+            'Tuesday, no wait, Wednesday works.': 'Wednesday works.',
+            'Send 5 dollars, I mean 6.': 'Send 6 dollars.',
+            'I have 2 kids, sorry, 3 kids.': 'I have 3 kids.',
+            'At 2pm, actually 3pm works.': 'At 3pm works.',
+            'We ship in March, no wait, April. It costs 5, actually 7.': 'We ship in April. It costs 7.',
+        }
+        for spoken, typed in cases.items():
+            self.assertEqual(apply_backtrack(spoken), typed, spoken)
+
+    def test_backtrack_leaves_ordinary_prose_alone(self):
+        from whisper_key.dictation_cleanup import apply_backtrack
+        for text in ('I actually like it.', 'Sorry, 3 people are here.',
+                     'It was 2. Actually 3 would be better.',   # never reaches across a sentence
+                     'Meet Tuesday at 2, actually Friday.'):    # class mismatch picks the weekday
+            expected = 'Meet Friday at 2.' if 'Friday' in text else text
+            self.assertEqual(apply_backtrack(text), expected, text)
+
+    def test_backtrack_is_linear_on_huge_dictations(self):
+        import time
+        from whisper_key.dictation_cleanup import apply_backtrack
+        text = 'I actually think ' * 20000 + 'at 2 actually 3'
+        start = time.monotonic()
+        self.assertTrue(apply_backtrack(text).endswith('at 3'))
+        self.assertLess(time.monotonic() - start, 2.0, 'must stay O(n)')
+
+    def test_backtrack_runs_only_when_enabled(self):
+        from whisper_key.text_postprocess import postprocess
+        self.assertEqual(postprocess('at 2 actually 3', {'voice_editing': False}), 'at 2 actually 3')
+        self.assertEqual(postprocess('at 2 actually 3', {'backtrack': {'enabled': True}}), 'at 3')
+        self.assertEqual(postprocess('at 2 swap 3', {'backtrack': {'enabled': True, 'cues': ['swap']}}), 'at 3')
+
+    # --- Stutters ---
+    def test_repeated_words_collapse_but_real_doubles_stay(self):
+        from whisper_key.dictation_cleanup import remove_repeated_words
+        self.assertEqual(remove_repeated_words('I I think the the cat'), 'I think the cat')
+        self.assertEqual(remove_repeated_words('We, we should go'), 'We should go')
+        for keep in ('I had had enough', 'very very good', 'Bye bye', '11 11'):
+            self.assertEqual(remove_repeated_words(keep), keep)
+
+    # --- Spoken lists ---
+    def test_spoken_list_becomes_a_list(self):
+        from whisper_key.dictation_cleanup import apply_list_formatting
+        self.assertEqual(apply_list_formatting('My list: first, milk. Second, eggs. Third, bread.'),
+                         'My list:\n1. Milk\n2. Eggs\n3. Bread')
+        self.assertEqual(apply_list_formatting('One, buy milk. Two, call mom, and three, pay rent.'),
+                         '1. Buy milk\n2. Call mom\n3. Pay rent')
+        self.assertEqual(apply_list_formatting('first, milk. second, eggs', style='bullets'),
+                         '- Milk\n- Eggs')
+
+    def test_prose_that_counts_is_not_a_list(self):
+        from whisper_key.dictation_cleanup import apply_list_formatting
+        for text in ('One of the two options is fine.', 'First, we go.',
+                     'First of all, hello. Second, world.'):
+            self.assertEqual(apply_list_formatting(text), text)
+
+    def test_list_takes_no_closing_period(self):
+        from whisper_key.text_postprocess import postprocess
+        self.assertEqual(postprocess('first, milk. second, eggs.',
+                                     {'list_formatting': True, 'ensure_punctuation': True}),
+                         '1. Milk\n2. Eggs')
+
+    # --- Lowercase / styles ---
+    def test_lowercase_keeps_acronyms_mixed_case_and_taught_terms(self):
+        from whisper_key.dictation_cleanup import apply_lowercase
+        self.assertEqual(apply_lowercase('Hello There, NASA and iPhone and Rohit.', protected=['Rohit']),
+                         'hello there, NASA and iPhone and Rohit.')
+
+    def test_style_resolution(self):
+        from whisper_key.styles import resolve_style
+        self.assertTrue(resolve_style('very casual')['lowercase'])
+        self.assertEqual(resolve_style('nope'), {}, 'unknown styles are ignored')
+        self.assertEqual(resolve_style(''), {})
+        custom = resolve_style('shouty', {'styles': {'shouty': {'capitalize_first': True, 'ollama': True}}})
+        self.assertEqual(custom, {'capitalize_first': True}, 'a style can only set formatting toggles')
+
+    def test_style_precedence(self):
+        from whisper_key.app_rules import effective_postprocess_config
+        global_cfg = {'style': 'formal', 'capitalize_first': False}
+        cfg = effective_postprocess_config(global_cfg)
+        self.assertTrue(cfg['capitalize_first'], 'the global style wins over global toggles')
+        self.assertNotIn('style', cfg, 'resolved once, so postprocess() cannot re-apply it')
+        cfg = effective_postprocess_config(global_cfg, {'style': 'very_casual'})
+        self.assertTrue(cfg['lowercase'])
+        self.assertFalse(cfg['ensure_punctuation'], "the app's style beats the global one")
+        cfg = effective_postprocess_config(global_cfg, {'style': 'very_casual', 'lowercase': False})
+        self.assertFalse(cfg['lowercase'], "a rule's own toggle beats its style")
+
+    def test_postprocess_applies_a_style_key(self):
+        from whisper_key.text_postprocess import postprocess
+        self.assertEqual(postprocess('Hello There', {'style': 'formal'}), 'Hello There.')
+        self.assertEqual(postprocess('Hello There.', {'style': 'very_casual'}), 'hello there')
+
+    def test_shipped_app_rules_use_known_styles(self):
+        from ruamel.yaml import YAML
+        from whisper_key.styles import STYLE_PRESETS
+        rules = YAML().load((ROOT / 'src' / 'whisper_key' / 'app_rules.defaults.yaml').read_text(encoding='utf-8'))['rules']
+        styles = [r['style'] for r in rules if 'style' in r]
+        self.assertTrue(styles)
+        for style in styles:
+            self.assertIn(style, STYLE_PRESETS)
+
+    # --- Snippets ---
+    _SNIPPETS = [{'trigger': 'my signature', 'expansion': 'Best,\nRohit'},
+                 {'trigger': 'my work signature', 'expansion': 'Rohit B.\nEngineer'},
+                 {'trigger': 'my address', 'expansion': '1 Main St', 'mode': 'alone'},
+                 {'trigger': 'weird', 'expansion': r'\1 $0 (.*)'},
+                 {'nonsense': True}, 'not even a dict']
+
+    def test_snippet_expands_inline(self):
+        from whisper_key.snippets import expand_snippets
+        self.assertEqual(expand_snippets('Thanks. My signature.', self._SNIPPETS), ('Thanks. Best,\nRohit', False))
+        self.assertEqual(expand_snippets('Thanks. my work signature', self._SNIPPETS)[0],
+                         'Thanks. Rohit B.\nEngineer', 'the longer trigger wins')
+
+    def test_whole_utterance_snippet_is_delivered_verbatim(self):
+        from whisper_key.text_postprocess import postprocess
+        cfg = {'capitalize_first': True, 'ensure_punctuation': True, 'snippets': self._SNIPPETS}
+        self.assertEqual(postprocess('My signature.', cfg), 'Best,\nRohit')
+        self.assertEqual(postprocess('My address', cfg), '1 Main St')
+        self.assertEqual(postprocess('send my address now', cfg), 'Send my address now.',
+                         '"alone" snippets never fire mid-sentence')
+
+    def test_snippet_expansion_is_literal_and_variables_fill_in(self):
+        import datetime
+        from whisper_key.snippets import expand_snippets
+        self.assertEqual(expand_snippets('weird', self._SNIPPETS)[0], r'\1 $0 (.*)')
+        today = datetime.date.today().strftime('%Y-%m-%d')
+        text, _ = expand_snippets('stamp', [{'trigger': 'stamp', 'expansion': 'On ${date}'}])
+        self.assertEqual(text, 'On ' + today)
+
+    def test_lowercase_style_never_touches_a_snippet(self):
+        from whisper_key.text_postprocess import postprocess
+        cfg = {'style': 'very_casual', 'snippets': self._SNIPPETS}
+        self.assertEqual(postprocess('Thanks. My signature.', cfg), 'thanks. Best,\nRohit')
+
+    # --- Double-tap lock ---
+    def _latch(self, recording=True):
+        from whisper_key.hotkey_gestures import TapLatch
+        now = [0.0]
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, seconds, callback):
+                self.callback, self.cancelled = callback, False
+                timers.append(self)
+
+            def cancel(self):
+                self.cancelled = True
+        events = []
+        latch = TapLatch(start=lambda: events.append('start'), stop=lambda: events.append('stop'),
+                         window_ms=400, is_recording=lambda: recording,
+                         clock=lambda: now[0], timer_factory=FakeTimer)
+        return latch, events, now, timers
+
+    def test_hold_is_plain_push_to_talk(self):
+        latch, events, now, _ = self._latch()
+        latch.press()
+        now[0] = 2.0
+        latch.release()
+        self.assertEqual(events, ['start', 'stop'])
+        self.assertEqual(latch.state, latch.IDLE)
+
+    def test_single_quick_tap_stops_after_the_window(self):
+        latch, events, now, timers = self._latch()
+        latch.press()
+        now[0] = 0.1
+        latch.release()
+        self.assertEqual(events, ['start'], 'must not stop inside the double-tap window')
+        timers[-1].callback()
+        self.assertEqual(events, ['start', 'stop'])
+
+    def test_double_tap_locks_and_a_third_tap_stops(self):
+        latch, events, now, timers = self._latch()
+        latch.press(); now[0] = 0.1; latch.release()
+        now[0] = 0.2; latch.press()
+        self.assertTrue(timers[-1].cancelled)
+        self.assertEqual(latch.state, latch.LATCHED)
+        now[0] = 0.3; latch.release()
+        self.assertEqual(events, ['start'], 'releasing while locked does nothing')
+        now[0] = 9.0; latch.press()
+        self.assertEqual(events, ['start', 'stop'])
+
+    def test_lock_resyncs_when_recording_ended_elsewhere(self):
+        latch, events, now, _ = self._latch(recording=False)
+        latch.state = latch.LATCHED          # e.g. the silence timeout stopped it
+        latch.press()
+        self.assertEqual(events, ['start'], 'the next tap starts a new recording')
+
+    # --- Paste-last and hotkey wiring (real classes, heavy deps faked) ---
+    def _import_app_modules(self):
+        import types
+        import unittest.mock as mock
+        try:
+            import numpy  # noqa: F401  (must predate the sys.modules snapshot)
+        except ImportError:
+            self.skipTest('numpy not installed')
+        fakes = fake_platform_modules()
+        for name in ('PIL', 'PIL.Image', 'PIL.ImageDraw', 'pystray', 'sounddevice', 'soxr',
+                     'faster_whisper', 'playsound3'):
+            fakes[name] = _stand_in_module(name)
+        reimport_under(self, fakes)
+        from whisper_key.hotkey_listener import HotkeyListener
+        from whisper_key.state_manager import StateManager
+        return HotkeyListener, StateManager
+
+    def _state_manager(self, last=None, state='idle'):
+        import unittest.mock as mock
+        _, StateManager = self._import_app_modules()
+        sm = StateManager.__new__(StateManager)
+        sm.logger = __import__('logging').getLogger('test')
+        sm.last_transcription = last
+        sm.clipboard_manager = mock.Mock()
+        sm.system_tray = mock.Mock()
+        sm.get_current_state = lambda: state
+        sm._wait_for_modifiers_released = lambda: None
+        return sm
+
+    def test_paste_last_retypes_without_auto_send(self):
+        sm = self._state_manager(last='hello world')
+        self.assertTrue(sm.paste_last_transcription())
+        sm.clipboard_manager.deliver_transcription.assert_called_once_with('hello world', use_auto_enter=False)
+
+    def test_paste_last_with_nothing_to_paste_says_so(self):
+        sm = self._state_manager(last=None)
+        self.assertFalse(sm.paste_last_transcription())
+        sm.clipboard_manager.deliver_transcription.assert_not_called()
+        sm.system_tray.notify.assert_called_once()
+
+    def test_paste_last_waits_while_recording(self):
+        sm = self._state_manager(last='x', state='recording')
+        self.assertFalse(sm.paste_last_transcription())
+        sm.clipboard_manager.deliver_transcription.assert_not_called()
+
+    def test_listener_registers_the_new_hotkeys(self):
+        import unittest.mock as mock
+        HotkeyListener, _ = self._import_app_modules()
+        with mock.patch.object(HotkeyListener, 'start_listening'):
+            listener = HotkeyListener(mock.Mock(), 'ctrl+win', 'ctrl', paste_last_hotkey='alt+shift+z',
+                                      double_tap_to_lock=True, double_tap_window_ms=300)
+        combos = [binding[0] for binding in listener.hotkey_bindings]
+        self.assertIn('alt+shift+z', combos)
+        self.assertIsNotNone(listener.tap_latch)
+        self.assertAlmostEqual(listener.tap_latch.window, 0.3)
+        paste = next(b for b in listener.hotkey_bindings if b[0] == 'alt+shift+z')
+        # On press: the macOS backend only reports releases for modifier-only
+        # chords, so a release-only binding never fired there.
+        self.assertIsNotNone(paste[1])
+        self.assertIsNone(paste[2])
+        with mock.patch.object(HotkeyListener, 'start_listening'):
+            plain = HotkeyListener(mock.Mock(), 'ctrl+win', 'ctrl', recording_mode='toggle',
+                                   double_tap_to_lock=True)
+        self.assertIsNone(plain.tap_latch, 'toggle mode is already hands-free')
+
+    # --- Whisper mode ---
+    def test_whisper_mode_boosts_only_quiet_speech(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest('numpy not installed')
+        from whisper_key.audio_gain import boost_quiet_audio, TARGET_PEAK
+        t = np.linspace(0, 1, 16000, dtype=np.float32)
+        quiet = (0.1 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)  # needs 6x, under the 8x cap
+        boosted = boost_quiet_audio(quiet, max_gain=8.0)
+        self.assertAlmostEqual(float(np.max(np.abs(boosted))), TARGET_PEAK, delta=0.02)
+        self.assertEqual(boosted.dtype, np.float32)
+        capped = boost_quiet_audio((0.01 * np.sin(2 * np.pi * 220 * t)).astype(np.float32), max_gain=4.0)
+        self.assertAlmostEqual(float(np.max(np.abs(capped))), 0.04, delta=0.005)
+        loud = (0.9 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        self.assertIs(boost_quiet_audio(loud), loud, 'never turns the volume down')
+        silence = np.full(16000, 1e-5, dtype=np.float32)
+        self.assertIs(boost_quiet_audio(silence), silence, 'never amplifies a muted mic')
+
+    # --- Config & settings ---
+    def test_new_settings_ship_with_safe_defaults(self):
+        from ruamel.yaml import YAML
+        cfg = YAML().load((ROOT / 'src' / 'whisper_key' / 'config.defaults.yaml').read_text(encoding='utf-8'))
+        pp = cfg['postprocess']
+        self.assertFalse(pp['backtrack']['enabled'])
+        self.assertFalse(pp['remove_repeated_words'])
+        self.assertFalse(pp['list_formatting'])
+        self.assertFalse(pp['lowercase'])
+        self.assertEqual(pp['style'], '')
+        self.assertEqual(list(pp['snippets']), [])
+        self.assertFalse(cfg['hotkey']['double_tap_to_lock'])
+        self.assertFalse(cfg['audio']['whisper_mode']['enabled'])
+        self.assertIn('macos:', cfg['hotkey']['paste_last_hotkey'])
+
+
+class ReleaseReviewFixTests(unittest.TestCase):
+    """Findings from the pre-release review of 0.20.0, each pinned so it can't
+    come back."""
+
+    def test_backtrack_handles_decimals_and_money(self):
+        from whisper_key.dictation_cleanup import apply_backtrack
+        self.assertEqual(apply_backtrack('The rate is 2.5, actually 3'), 'The rate is 3')
+        self.assertEqual(apply_backtrack('It costs $1.50, sorry, $2'), 'It costs $2')
+        self.assertEqual(apply_backtrack('Version 3.1, I mean 4'), 'Version 4')
+
+    def test_backtrack_am_pm_needs_a_word_end(self):
+        from whisper_key.dictation_cleanup import apply_backtrack
+        self.assertEqual(apply_backtrack('I have 2 amazing kids, actually 3'), 'I have 3 amazing kids')
+
+    def test_backtrack_leaves_prose_after_a_cue_alone(self):
+        from whisper_key.dictation_cleanup import apply_backtrack
+        for text in ('We saw 3 movies, actually one of them was great',
+                     'I have 2 questions, actually one more thing',
+                     'Invite 2 guests, actually 3 amazing people'):
+            self.assertEqual(apply_backtrack(text), text)
+
+    def test_backtrack_string_cue_is_one_cue(self):
+        from whisper_key.dictation_cleanup import apply_backtrack
+        from whisper_key.text_postprocess import postprocess
+        self.assertEqual(apply_backtrack('I bought 2 apples and a 3 pack', 'actually'),
+                         'I bought 2 apples and a 3 pack')
+        self.assertEqual(postprocess('at 2 actually 3', {'backtrack': {'enabled': True, 'cues': 'actually'}}),
+                         'at 3')
+
+    def test_backtrack_stays_linear_with_many_corrections(self):
+        import time
+        from whisper_key.dictation_cleanup import apply_backtrack
+        text = 'at 2 tomorrow actually 3. ' * 20000
+        start = time.monotonic()
+        result = apply_backtrack(text)
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertTrue(result.startswith('at 3 tomorrow. at 3 tomorrow.'))
+
+    def test_stutter_removal_respects_contractions_and_clauses(self):
+        from whisper_key.dictation_cleanup import remove_repeated_words
+        for text in ("Thank you, you're welcome.", "You can, can't you?",
+                     "If you want it, it's yours.", 'Whatever you choose, choose wisely.'):
+            self.assertEqual(remove_repeated_words(text), text)
+        self.assertEqual(remove_repeated_words('Ok. I, I think so'), 'Ok. I think so')
+
+    def test_list_ends_at_its_last_sentence(self):
+        from whisper_key.dictation_cleanup import apply_list_formatting
+        self.assertEqual(apply_list_formatting('Groceries: first, milk. second, eggs. See you tonight.'),
+                         'Groceries:\n1. Milk\n2. Eggs\n\nSee you tonight.')
+
+    def test_odd_case_folding_never_raises(self):
+        from whisper_key.dictation_cleanup import apply_list_formatting
+        from whisper_key.snippets import expand_snippets
+        self.assertEqual(apply_list_formatting('FİRST, milk. second, eggs.'), 'FİRST, milk. second, eggs.')
+        expand_snippets('say fİve now', [{'trigger': 'five', 'expansion': '5'}])
+
+    def test_snippet_keeps_sentence_punctuation_mid_text(self):
+        from whisper_key.snippets import expand_snippets
+        text, _ = expand_snippets('Send it to my email, then call me. My email.',
+                                  [{'trigger': 'my email', 'expansion': 'me@x.com'}])
+        self.assertEqual(text, 'Send it to me@x.com, then call me. me@x.com')
+
+    def test_lowercase_keeps_contracted_i_and_multiword_terms(self):
+        from whisper_key.dictation_cleanup import apply_lowercase
+        self.assertEqual(apply_lowercase("I'm sure Rohit Burani and I'll Go", protected=['Rohit Burani']),
+                         "I'm sure Rohit Burani and I'll go")
+
+    def test_settings_save_keeps_custom_styles_and_corrections(self):
+        reimport_under(self, fake_platform_modules())  # config_manager imports the platform layer
+        from whisper_key.config_manager import _compute_overrides
+        defaults = {'postprocess': {'styles': {}, 'corrections': {}, 'style': ''}}
+        user = {'postprocess': {'styles': {'shouty': {'capitalize_first': True}},
+                                'corrections': {'CAPEX': ['cap x']}, 'style': 'shouty'}}
+        kept = _compute_overrides(user, defaults)['postprocess']
+        self.assertIn('shouty', kept['styles'])
+        self.assertIn('CAPEX', kept['corrections'])
+
+    def test_verbatim_keeps_spoken_formatting(self):
+        from whisper_key.styles import resolve_style
+        self.assertNotIn('inline_formatting', resolve_style('verbatim'),
+                         '"new line" / "comma" must keep working in code editors')
+
+    def test_specific_app_rules_come_before_title_matches(self):
+        from ruamel.yaml import YAML
+        rules = YAML().load((ROOT / 'src' / 'whisper_key' / 'app_rules.defaults.yaml').read_text(encoding='utf-8'))['rules']
+        order = [r['match'][0] for r in rules]
+        self.assertLess(order.index('code.exe'), order.index('slack.exe'),
+                        'a VS Code window titled "slack_bot.py" must not auto-send')
+        self.assertLess(order.index('code.exe'), order.index('outlook.exe'))
+
+    # --- Hands-free lock vs a stop key inside the record chord ---
+    def _latch(self, recording=True):
+        from whisper_key.hotkey_gestures import TapLatch
+        now = [0.0]
+        events = []
+
+        class FakeTimer:
+            def __init__(self, seconds, callback):
+                self.callback = callback
+
+            def cancel(self):
+                pass
+        latch = TapLatch(start=lambda: events.append('start'), stop=lambda: events.append('stop'),
+                         window_ms=400, is_recording=lambda: recording,
+                         clock=lambda: now[0], timer_factory=FakeTimer)
+        return latch, events, now
+
+    def test_stop_key_is_ignored_while_the_second_tap_begins(self):
+        latch, events, now = self._latch()
+        latch.press(); now[0] = 0.1; latch.release()
+        now[0] = 0.2
+        self.assertTrue(latch.intercept_stop_key(), 'Ctrl of the 2nd Ctrl+Win tap must not stop')
+        latch.press()
+        self.assertEqual(latch.state, latch.LATCHED)
+
+    def test_stop_key_ends_a_lock_without_restarting(self):
+        latch, events, now = self._latch()
+        latch.state = latch.LATCHED
+        self.assertFalse(latch.intercept_stop_key(), 'a real stop while locked')
+        now[0] = 0.05
+        latch.press()                    # the chord completing right after Ctrl
+        self.assertEqual(events, [], 'must not start a junk recording')
+        now[0] = 5.0
+        latch.press()
+        self.assertEqual(events, ['start'], 'later presses work normally')
+
+    # --- Paste-last honours app rules ---
+    def _paste_sm(self, rule):
+        import unittest.mock as mock
+        helper = WisprStyleFeatureTests('test_paste_last_retypes_without_auto_send')
+        helper.addCleanup = self.addCleanup
+        helper.skipTest = self.skipTest
+        sm = helper._state_manager(last='rm -rf build\n')
+        sm.app_rules = mock.Mock()
+        sm.app_rules.match_for_foreground.return_value = rule
+        return sm
+
+    def test_paste_last_skips_suppressed_apps(self):
+        sm = self._paste_sm({'match': ['1password.exe'], 'suppress': True})
+        self.assertFalse(sm.paste_last_transcription())
+        sm.clipboard_manager.deliver_transcription.assert_not_called()
+        sm.clipboard_manager.copy_text.assert_not_called()
+
+    def test_paste_last_only_copies_in_copy_only_apps(self):
+        sm = self._paste_sm({'match': ['wt.exe'], 'auto_paste': False})
+        self.assertTrue(sm.paste_last_transcription())
+        sm.clipboard_manager.deliver_transcription.assert_not_called()
+        sm.clipboard_manager.copy_text.assert_called_once()
+
+    # --- Whisper mode config is validated, and boosts after the trims ---
+    def test_whisper_mode_config_is_validated(self):
+        helper = WisprStyleFeatureTests('test_paste_last_retypes_without_auto_send')
+        helper.addCleanup = self.addCleanup
+        helper.skipTest = self.skipTest
+        helper._import_app_modules()
+        from whisper_key.audio_recorder import AudioRecorder
+        parse = AudioRecorder._parse_whisper_mode
+        self.assertIsNone(parse(True))
+        self.assertIsNone(parse({'enabled': False}))
+        self.assertIsNone(parse({'enabled': 'no'}), 'YAML 1.2 "no" is a string, not an opt-in')
+        self.assertEqual(parse({'enabled': True, 'max_gain': '8x'}), 8.0)
+        self.assertEqual(parse({'enabled': True, 'max_gain': 4}), 4.0)
+
+    def test_whisper_mode_boosts_after_silence_trimming(self):
+        source = (ROOT / 'src' / 'whisper_key' / 'audio_recorder.py').read_text(encoding='utf-8')
+        body = source[source.index('def _build_audio_array'):source.index('def _parse_whisper_mode')]
+        self.assertLess(body.index('_trim_trailing_silence(audio_array)'), body.index('boost_quiet_audio('),
+                        'a boosted noise floor would defeat the anti-hallucination trims')
+
+    def test_settings_window_tolerates_non_mapping_sections(self):
+        source = (ROOT / 'src' / 'whisper_key' / 'settings_ui.py').read_text(encoding='utf-8')
+        self.assertIn("wm = wm if isinstance(wm, dict) else {}", source)
+        self.assertIn("bt = bt if isinstance(bt, dict) else {}", source)
+
+    def test_bad_numeric_hotkey_setting_falls_back(self):
+        source = (ROOT / 'src' / 'whisper_key' / 'main.py').read_text(encoding='utf-8')
+        self.assertIn("_int_setting(hotkey_config.get('double_tap_window_ms'), 400)", source)
+
+    def test_yaml_no_means_off(self):
+        from whisper_key.text_postprocess import postprocess
+        self.assertEqual(postprocess('first, milk. second, eggs', {'list_formatting': 'no'}),
+                         'first, milk. second, eggs')
+        self.assertEqual(postprocess('first, milk. second, eggs', {'list_formatting': 'yes'}),
+                         '1. Milk\n2. Eggs')
+        self.assertEqual(postprocess('hello', {'capitalize_first': True}), 'Hello')
+
+
+# ── Layered defaults (0.21.0) ────────────────────────────────────────────────
+# Until 0.21 each of app_rules / commands / transforms / profiles was copied out
+# of the package once, on first launch, and never touched again. Every later
+# improvement to a shipped file reached new installs only: a machine set up in
+# May still had May's rules eleven releases on, including the ordering bug that
+# let a code editor showing "slack_bot.py" match the chat rule and auto-send.
+# The shipped entries now load from the package every time, and the user's file
+# holds only their own entries plus per-id overrides.
+class LayeredDefaultsTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = Path(tempfile.mkdtemp(prefix='wl-layer-'))
+
+    def _read(self, name):
+        from ruamel.yaml import YAML
+        with open(self.dir / name, encoding='utf-8') as f:
+            return YAML().load(f) or {}
+
+    def _write(self, name, text):
+        (self.dir / name).write_text(text, encoding='utf-8')
+
+    # A user file in the pre-0.21 shape: a full copy of the defaults as they
+    # were, chat rules ahead of code editors, and no styles.
+    def _write_old_app_rules(self):
+        self._write('app_rules.yaml', (
+            'rules:\n'
+            '  - match: ["slack.exe", "discord.exe", "telegram.exe", "whatsapp.exe", "Slack", "Discord"]\n'
+            '    auto_send: true\n'
+            '    initial_prompt: "Casual chat message. Conversational tone."\n'
+            '  - match: ["code.exe", "cursor.exe", "windsurf.exe", "rider64.exe", "pycharm64.exe", "idea64.exe"]\n'
+            '    auto_paste: false\n'
+            '    initial_prompt: "Programming context. Identifiers, snake_case, camelCase, file paths, regex."\n'
+            '  - match: ["mytool.exe"]\n'
+            '    suppress: true\n'))
+
+    def _load_rules(self):
+        import unittest.mock as mock
+        import whisper_key.app_rules as ar
+        with mock.patch.object(ar, 'get_user_app_data_path', return_value=str(self.dir)):
+            return ar.AppRules().rules
+
+    def test_shipped_rules_load_with_no_user_file(self):
+        rules = self._load_rules()
+        self.assertEqual([r.get('id') for r in rules],
+                         ['password-managers', 'terminals', 'code-editors',
+                          'chat-apps', 'email-clients'])
+        self.assertEqual(self._read('app_rules.yaml').get('rules'), [],
+                         'a fresh user file must start empty, not as a copy of the defaults')
+
+    def test_every_shipped_rule_has_an_id(self):
+        # An id-less shipped rule could never be overridden or disabled, and a
+        # migration would keep re-adding the user's copy of it as a duplicate.
+        from ruamel.yaml import YAML
+        path = ROOT / 'src' / 'whisper_key' / 'app_rules.defaults.yaml'
+        with open(path, encoding='utf-8') as f:
+            shipped = YAML().load(f)['rules']
+        ids = [r.get('id') for r in shipped]
+        self.assertTrue(all(ids), f'shipped rule without an id: {ids}')
+        self.assertEqual(len(ids), len(set(ids)), f'duplicate shipped ids: {ids}')
+
+    def test_editors_are_matched_before_chat(self):
+        # The slack_bot.py bug: window titles match by substring, so the code
+        # editor rule has to come first.
+        ids = [r.get('id') for r in self._load_rules()]
+        self.assertLess(ids.index('code-editors'), ids.index('chat-apps'))
+
+    def test_old_file_gains_later_shipped_rules_and_order(self):
+        self._write_old_app_rules()
+        rules = self._load_rules()
+        ids = [r.get('id') for r in rules]
+        self.assertIn('email-clients', ids, 'a rule added after the user first launched')
+        self.assertLess(ids.index('code-editors'), ids.index('chat-apps'))
+        editors = next(r for r in rules if r.get('id') == 'code-editors')
+        self.assertEqual(editors.get('style'), 'verbatim',
+                         'a key added to a shipped rule after the copy was made')
+
+    def test_migration_keeps_the_users_own_rule_and_drops_the_copies(self):
+        self._write_old_app_rules()
+        rules = self._load_rules()
+        own = [r for r in rules if not r.get('id')]
+        self.assertEqual([r['match'] for r in own], [['mytool.exe']])
+        self.assertEqual(self._read('app_rules.yaml').get('rules'),
+                         [{'match': ['mytool.exe'], 'suppress': True}],
+                         'unedited copies of shipped rules should not survive migration')
+
+    def test_migration_backs_up_the_original(self):
+        self._write_old_app_rules()
+        before = (self.dir / 'app_rules.yaml').read_text(encoding='utf-8')
+        self._load_rules()
+        backups = list(self.dir.glob('app_rules.yaml.*.bak'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding='utf-8'), before)
+
+    def test_migration_runs_once(self):
+        self._write_old_app_rules()
+        first = self._load_rules()
+        second = self._load_rules()
+        self.assertEqual([r.get('id') for r in first], [r.get('id') for r in second])
+        self.assertEqual(len(list(self.dir.glob('*.bak'))), 1)
+
+    def test_an_edited_shipped_rule_becomes_an_override(self):
+        # Only the edited key is kept, so every other key keeps following the
+        # shipped rule as it changes.
+        self._write('app_rules.yaml', (
+            'rules:\n'
+            '  - match: ["outlook.exe", "thunderbird.exe", "Mail"]\n'
+            '    style: casual\n'
+            '    initial_prompt: "Professional email body. Polite, clear sentences."\n'))
+        rules = self._load_rules()
+        self.assertEqual(self._read('app_rules.yaml')['rules'],
+                         [{'id': 'email-clients', 'style': 'casual'}])
+        email = next(r for r in rules if r.get('id') == 'email-clients')
+        self.assertEqual(email['style'], 'casual')
+        self.assertEqual(email['match'], ['outlook.exe', 'thunderbird.exe', 'Mail'])
+
+    def test_user_rules_are_matched_before_shipped_rules(self):
+        self._write('app_rules.yaml',
+                    'format: 2\nrules:\n  - match: ["code.exe"]\n    style: casual\n')
+        rules = self._load_rules()
+        self.assertEqual(rules[0]['match'], ['code.exe'])
+        self.assertEqual(rules[0]['style'], 'casual')
+
+    def test_disabled_drops_a_shipped_rule(self):
+        self._write('app_rules.yaml',
+                    'format: 2\nrules:\n  - id: terminals\n    disabled: true\n')
+        rules = self._load_rules()
+        self.assertNotIn('terminals', [r.get('id') for r in rules])
+        self.assertTrue(all('disabled' not in r for r in rules))
+
+    def test_override_inherits_the_keys_it_does_not_set(self):
+        self._write('app_rules.yaml',
+                    'format: 2\nrules:\n  - id: chat-apps\n    auto_send: false\n')
+        chat = next(r for r in self._load_rules() if r.get('id') == 'chat-apps')
+        self.assertIs(chat['auto_send'], False)
+        self.assertEqual(chat['style'], 'casual')
+        self.assertIn('slack.exe', chat['match'])
+
+    def test_a_broken_package_falls_back_to_the_user_file(self):
+        # Losing the shipped file must not throw the user's own rules away.
+        import unittest.mock as mock
+        import whisper_key.defaults_merge as dm
+        self._write('app_rules.yaml', 'format: 2\nrules:\n  - match: ["mytool.exe"]\n')
+        with mock.patch.object(dm, 'resolve_asset_path', return_value=str(self.dir / 'nope.yaml')):
+            merged, _ = dm.load_layered('nope.yaml', self.dir / 'app_rules.yaml',
+                                        'rules', '', id_key='id')
+        self.assertEqual(merged, [{'match': ['mytool.exe']}])
+
+    def test_profiles_active_falls_back_to_the_shipped_default(self):
+        import unittest.mock as mock
+        import whisper_key.profiles as pf
+        with mock.patch.object(pf, 'get_user_app_data_path', return_value=str(self.dir)):
+            manager = pf.ProfileManager(config_manager=mock.MagicMock())
+        self.assertEqual(manager.active, 'dictation')
+        self.assertEqual(sorted(manager.profiles),
+                         ['chat', 'code', 'dictation', 'notes', 'translate'])
+
+    def test_profiles_migration_preserves_the_active_choice(self):
+        import unittest.mock as mock
+        import whisper_key.profiles as pf
+        self._write('profiles.yaml',
+                    'active: code\nprofiles:\n  code:\n    description: Mine\n')
+        with mock.patch.object(pf, 'get_user_app_data_path', return_value=str(self.dir)):
+            manager = pf.ProfileManager(config_manager=mock.MagicMock())
+        self.assertEqual(manager.active, 'code')
+        self.assertEqual(manager.profiles['code']['description'], 'Mine')
+        self.assertIn('overrides', manager.profiles['code'], 'the shipped body should survive')
+
+    def test_transform_override_inherits_the_prompt(self):
+        import unittest.mock as mock
+        try:
+            import whisper_key.transforms as tr
+        except ImportError as e:
+            self.skipTest(f'transforms needs deps the lean env lacks: {e}')
+        self._write('transforms.yaml',
+                    'format: 2\ntransforms:\n  - name: polish\n    hotkey: "win+alt+9"\n'
+                    '  - name: expand\n    disabled: true\n')
+        with mock.patch.object(tr, 'get_user_app_data_path', return_value=str(self.dir)):
+            manager = tr.TransformsManager()
+        names = [t.get('name') for t in manager.transforms]
+        self.assertNotIn('expand', names)
+        polish = next(t for t in manager.transforms if t['name'] == 'polish')
+        self.assertEqual(polish['hotkey'], 'win+alt+9')
+        self.assertTrue(polish.get('prompt'), 'the shipped prompt should still be there')
+
+    def test_a_null_action_lets_an_override_swap_a_commands_action(self):
+        # The merge keeps the shipped `hotkey` key, so clearing it has to mean
+        # "no action here" to both the validator and the dispatcher.
+        import unittest.mock as mock
+        reimport_under(self, fake_platform_modules())
+        try:
+            import whisper_key.voice_commands as vc
+        except ImportError as e:
+            self.skipTest(f'voice_commands needs deps the lean env lacks: {e}')
+        self._write('commands.yaml',
+                    'format: 2\ncommands:\n  - trigger: "maximize"\n'
+                    '    hotkey: null\n    type: "maximised"\n')
+        with mock.patch.object(vc, 'get_user_app_data_path', return_value=str(self.dir)):
+            manager = vc.VoiceCommandManager(enabled=True)
+        swapped = next(c for c in manager.commands if c.get('trigger') == 'maximize')
+        self.assertIsNone(swapped['hotkey'])
+        self.assertEqual(swapped['type'], 'maximised')
+
+    def test_dispatcher_tests_action_values_not_key_presence(self):
+        source = (ROOT / 'src' / 'whisper_key' / 'voice_commands.py').read_text(encoding='utf-8')
+        body = source[source.index('def _execute_action'):]
+        body = body[:body.index('def ', 10)]
+        for key in ('run', 'hotkey', 'type', 'rephrase'):
+            self.assertIn("command.get('" + key + "') is not None", body,
+                          f"a cleared '{key}' would still be dispatched")
+
+    def test_doctor_reports_the_effective_counts(self):
+        # The user file holds overrides only, so counting its entries would tell
+        # someone they have 0 rules while five are in force.
+        source = (ROOT / 'src' / 'whisper_key' / 'doctor.py').read_text(encoding='utf-8')
+        self.assertIn('rules in effect', source)
+        self.assertIn('Voice commands in effect', source)
+
+    def test_an_edited_match_list_overrides_instead_of_duplicating(self):
+        # Dropping an app from a shipped rule has to actually drop it. If the
+        # edited rule were kept as a separate one, the shipped rule would sit
+        # behind it and go on auto-sending in the app that was removed.
+        self._write('app_rules.yaml',
+                    'rules:' + LF +
+                    '  - match: ["slack.exe", "telegram.exe"]' + LF +
+                    '    auto_send: true' + LF)
+        rules = self._load_rules()
+        chat = [r for r in rules if r.get('id') == 'chat-apps']
+        self.assertEqual(len(chat), 1, 'the edited rule and the shipped one both loaded')
+        self.assertEqual(chat[0]['match'], ['slack.exe', 'telegram.exe'])
+        self.assertEqual([r for r in rules if not r.get('id')], [],
+                         'it should have become an override, not a rule of its own')
+        import whisper_key.app_rules as ar
+        matcher = ar.AppRules._matches
+        self.assertFalse(any(matcher(None, r, 'discord.exe', '') for r in rules),
+                         'discord was removed from the list but still matches')
+        self.assertTrue(any(matcher(None, r, 'slack.exe', '') for r in rules))
+
+    def test_broken_user_yaml_is_never_overwritten(self):
+        # A typo in their file must not read as "no entries" and trigger the
+        # migration, which would rewrite what they were in the middle of
+        # editing. The app runs on the shipped rules until they fix it.
+        broken = 'rules:' + LF + '  - match: ["a.exe"' + LF + '    style: casual' + LF
+        self._write('app_rules.yaml', broken)
+        rules = self._load_rules()
+        self.assertEqual([r.get('id') for r in rules],
+                         ['password-managers', 'terminals', 'code-editors',
+                          'chat-apps', 'email-clients'])
+        self.assertEqual((self.dir / 'app_rules.yaml').read_text(encoding='utf-8'), broken)
+        self.assertEqual(list(self.dir.glob('*.bak')), [])
+
+    def test_broken_package_hands_back_the_right_container(self):
+        # A list-shaped section must not come back as a dict just because the
+        # shipped file is unreadable: the callers iterate it.
+        import unittest.mock as mock
+        import whisper_key.defaults_merge as dm
+        missing = str(self.dir / 'nope.yaml')
+        with mock.patch.object(dm, 'resolve_asset_path', return_value=missing):
+            commands, _ = dm.load_layered('nope.yaml', self.dir / 'commands.yaml',
+                                          'commands', '', id_key='trigger')
+            profiles, _ = dm.load_layered('nope.yaml', self.dir / 'profiles.yaml',
+                                          'profiles', '', mapping=True)
+        self.assertEqual(commands, [])
+        self.assertEqual(profiles, {})
+
+    def test_a_corrupt_shipped_file_does_not_crash_the_loader(self):
+        import unittest.mock as mock
+        import whisper_key.defaults_merge as dm
+        bad = self.dir / 'bad.defaults.yaml'
+        bad.write_text('rules:' + LF + '  - match: ["a.exe"' + LF, encoding='utf-8')
+        self._write('app_rules.yaml', 'format: 2' + LF + 'rules: []' + LF)
+        with mock.patch.object(dm, 'resolve_asset_path', return_value=str(bad)):
+            merged, _ = dm.load_layered('bad.defaults.yaml', self.dir / 'app_rules.yaml',
+                                        'rules', '', id_key='id')
+        self.assertEqual(merged, [])

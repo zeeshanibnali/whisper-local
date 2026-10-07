@@ -37,7 +37,7 @@ from .utils import OptionalComponent
 from .voice_activity_detection import VadEvent, VadManager
 from .voice_commands import VoiceCommandManager
 from .profiles import ProfileManager
-from .app_rules import AppRules, formatting_overrides as app_rules_formatting_overrides
+from .app_rules import AppRules, formatting_overrides as app_rules_formatting_overrides, effective_postprocess_config
 from .streaming_delivery import StreamingDelivery, decide_stream_delivery
 from .transforms import TransformsManager
 from .text_postprocess import postprocess
@@ -452,6 +452,29 @@ class StateManager:
             self.logger.debug(f"Selection grab failed: {e}")
         return ''
     
+    # Tell the user, once per app per session, that a per-app rule made this
+    # delivery copy-only. Without it the app looks broken in exactly the place
+    # the rule is most useful — a code editor, where the shipped default is
+    # copy-only so dictation never types into source by surprise.
+    def _announce_copy_only(self, rule):
+        try:
+            seen = self._copy_only_announced
+        except AttributeError:
+            seen = self._copy_only_announced = set()
+        # Identify by the rule's own match pattern: it is always present,
+        # unlike the foreground exe, which isn't looked up until later in
+        # the pipeline.
+        match = rule.get('match')
+        key = str(match)
+        if key in seen:
+            return
+        seen.add(key)
+        where = ', '.join(match) if isinstance(match, (list, tuple)) else (match or 'this app')
+        self.system_tray.notify(
+            f"Copied, not pasted — your app rule for {where} is copy-only. "
+            "Press Ctrl+V, or edit app_rules.yaml to change it.")
+        self.logger.info(f"Copy-only delivery for {where} (app rule)")
+
     # The heart of the app: everything between "user released the hotkey" and
     # "text is in their editor". Runs on a worker thread so the hotkey listener
     # never blocks. Order matters — transcribe, then branch by mode (command /
@@ -521,11 +544,11 @@ class StateManager:
             # override formatting (e.g. code editors: verbatim, no auto-caps/periods)
             # in addition to the delivery behaviour handled further down.
             rule = self.app_rules.match_for_foreground()
-            postprocess_cfg = self.config_manager.get_postprocess_config()
-            fmt_overrides = app_rules_formatting_overrides(rule)
+            raw_postprocess_cfg = self.config_manager.get_postprocess_config()
+            fmt_overrides = app_rules_formatting_overrides(rule, raw_postprocess_cfg)
             if fmt_overrides:
-                postprocess_cfg = {**postprocess_cfg, **fmt_overrides}
                 self.logger.info(f"App rule {rule.get('match')} → formatting overrides {fmt_overrides}")
+            postprocess_cfg = effective_postprocess_config(raw_postprocess_cfg, rule)
             transcribed_text = postprocess(transcribed_text, postprocess_cfg)
 
             # Post-processing can legitimately empty the text — e.g. "scratch that"
@@ -539,21 +562,41 @@ class StateManager:
 
             if rule and rule.get('suppress'):
                 self.logger.info(f"Delivery suppressed by app rule: {rule.get('match')}")
-                self.clipboard_manager.copy_text(transcribed_text)
+                # Clipboard-free setups get the recovery window instead of a
+                # silent copy, so the transcript is still retrievable without
+                # touching the clipboard behind the user's back (issue #12).
+                may_copy = self.clipboard_manager.silent_copy_allowed
+                if may_copy:
+                    self.clipboard_manager.copy_text(transcribed_text)
+                else:
+                    self.fallback_window.show(
+                        transcribed_text,
+                        reason="Delivery is suppressed for this app, and clipboard "
+                               "copying is off — your dictation is safe here.",
+                        allow_clipboard=False,
+                    )
                 self.last_transcription = transcribed_text
                 self.recent_transcriptions.appendleft(transcribed_text)
                 self.system_tray.refresh_menu()
-                self.system_tray.notify("Delivery suppressed for this app — text on clipboard.")
+                self.system_tray.notify(
+                    "Delivery suppressed for this app — text on clipboard." if may_copy
+                    else "Delivery suppressed for this app — see the popup.")
                 if self.level_overlay:
                     self.level_overlay.flash_success()
                 return
 
             if not self._foreground_is_textable():
                 self.logger.info("No textable foreground window; opening fallback window")
-                self.clipboard_manager.copy_text(transcribed_text)
+                may_copy = self.clipboard_manager.silent_copy_allowed
+                if may_copy:
+                    self.clipboard_manager.copy_text(transcribed_text)
                 self.fallback_window.show(
                     transcribed_text,
-                    reason="No text field was focused — your dictation is safe here. Already on your clipboard.",
+                    reason=("No text field was focused — your dictation is safe here. "
+                            "Already on your clipboard.") if may_copy else
+                           ("No text field was focused — your dictation is safe here. "
+                            "Clipboard copying is off; use Copy if you want it."),
+                    allow_clipboard=may_copy,
                 )
                 self.last_transcription = transcribed_text
                 self.recent_transcriptions.appendleft(transcribed_text)
@@ -577,6 +620,12 @@ class StateManager:
             if effective_auto_paste is not None:
                 previous_auto_paste = self.clipboard_manager.auto_paste
                 self.clipboard_manager.update_auto_paste(effective_auto_paste)
+                # An app rule silently turning paste off reads as "the app is
+                # broken" — it was reported as exactly that (issue #11). Say it
+                # once per app per session: often enough to explain, rare enough
+                # not to nag.
+                if previous_auto_paste and not effective_auto_paste:
+                    self._announce_copy_only(rule)
 
             try:
                 success = self.clipboard_manager.deliver_transcription(
@@ -961,6 +1010,60 @@ class StateManager:
     def get_recent_transcriptions(self) -> list:
         return list(self.recent_transcriptions)
 
+    # Types the last dictation again at the cursor (paste-last hotkey), e.g.
+    # after it went to the wrong window. Never auto-sends, and the foreground
+    # app's rule still applies: nothing goes into a suppressed app (password
+    # managers), and copy-only apps (terminals, where a pasted newline runs a
+    # command) get the clipboard instead.
+    def paste_last_transcription(self) -> bool:
+        text = self.last_transcription
+        if not text:
+            self.system_tray.notify("Nothing to paste yet — dictate something first.")
+            return False
+        if self.get_current_state() != "idle":
+            self.logger.info("Paste-last ignored: busy recording or transcribing")
+            return False
+        self._wait_for_modifiers_released()
+        rule = None
+        try:
+            rule = self.app_rules.match_for_foreground()
+        except Exception as e:
+            self.logger.debug(f"Paste-last rule lookup failed: {e}")
+        try:
+            if rule and rule.get('suppress'):
+                self.logger.info(f"Paste-last suppressed by app rule: {rule.get('match')}")
+                self.system_tray.notify("Not pasted: this app is excluded in app_rules.yaml.")
+                return False
+            if rule and rule.get('auto_paste') is False:
+                self.clipboard_manager.copy_text(text)
+                self.system_tray.notify("Last dictation copied — this app is copy-only.")
+                return True
+            self.clipboard_manager.deliver_transcription(text, use_auto_enter=False)
+        except Exception as e:
+            self.logger.error(f"Paste-last failed: {e}")
+            self.system_tray.notify("Couldn't paste the last dictation.")
+            return False
+        return True
+
+    # A hotkey's release event can arrive while its other modifiers are still
+    # down, and those would merge into the paste. Wait briefly for the user to
+    # let go; after the timeout, deliver anyway rather than drop the request.
+    def _wait_for_modifiers_released(self, timeout: float = 1.5):
+        import time
+        try:
+            from .platform import keyboard as kb
+            modifiers_held = kb.modifiers_held
+        except (ImportError, AttributeError):
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if not modifiers_held():
+                    return
+            except Exception:
+                return
+            time.sleep(0.02)
+
     def recopy_recent_transcription(self, index: int):
         if 0 <= index < len(self.recent_transcriptions):
             text = self.recent_transcriptions[index]
@@ -1065,7 +1168,8 @@ class StateManager:
             streaming_manager = self.audio_recorder.streaming_manager
             on_streaming_result = self.audio_recorder.on_streaming_result
 
-            noise_cfg = (self.config_manager.config.get('audio') or {}).get('noise_suppression') or {}
+            audio_cfg = self.config_manager.config.get('audio') or {}
+            noise_cfg = audio_cfg.get('noise_suppression') or {}
             new_recorder = AudioRecorder(
                 on_vad_event=self.handle_vad_event,
                 channels=channels,
@@ -1077,6 +1181,7 @@ class StateManager:
                 on_streaming_result=on_streaming_result,
                 device=device_id if device_id != -1 else None,
                 noise_suppression_config=noise_cfg,
+                whisper_mode_config=audio_cfg.get('whisper_mode') or {},
             )
 
             self.audio_recorder = new_recorder

@@ -1,8 +1,12 @@
-# Whisper Key Local - Roadmap
+# Whisper Local - Roadmap
 @completed.md
 
 ## Next
--
+- As a *user* I want **"learn from my fix"** so that when I correct a dictation in place, one hotkey diffs my edit against what was typed and offers to save it as a correction or dictionary word (Wispr Flow's dictionary auto-learn, done offline)
+- As a *user* I want **restricted language auto-detect** (`whisper.languages: [en, hi]`) so switching between the languages I speak never lands on one I don't
+- As a *developer* I want **spoken casing commands** ("camel case foo bar" → `fooBar`, "snake case …") per app rule, for dictating identifiers
+- As a *user* I want **Command Mode without a selection**: "search Perplexity for …" opens a search, "write …" drafts via local Ollama
+- As a *user* I want the **level overlay on macOS**, running in its own process so Tk gets its main thread
 
 ## Bugs
 - **CUDA version forward-compatibility** - onboarding GPU detection doesn't recognize newer CUDA versions (e.g. CUDA 13.x), and CTranslate2 requires `cublas64_12.dll` which isn't present when only CUDA 13+ is installed. Workaround: manually copy CUDA 12 cuBLAS/cuDNN libs into CUDA 13 bin directory. Need to detect newer CUDA versions and guide users to install the required CUDA 12 compatibility libs
@@ -62,7 +66,7 @@
 - As a *user* I want **guided GPU setup** so drivers and dependencies are auto-detected, downloaded, and installed through an in-app UI instead of manual steps
 
 ### Packaging & Updates
-- As a *user*, I want **config version tracking with auto-reset on breaking changes** so my settings don't cause errors after major updates ([#22](https://github.com/PinW/whisper-key-local/issues/22))
+- As a *user*, I want **config version tracking with auto-reset on breaking changes** so my settings don't cause errors after major updates
 
 ### macOS
 - As a *mac user*, I want **pyapp build for macOS** so Mac users get the same single-binary packaging experience as Windows

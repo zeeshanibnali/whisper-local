@@ -11,10 +11,13 @@
 # Most --flags short-circuit and exit before the heavy app is even constructed,
 # so utility commands like --version, --doctor, --settings stay fast.
 
-from .utils import setup_portaudio_path
+from .utils import setup_nvidia_dll_path, setup_portaudio_path
 # PortAudio DLLs ship inside the package on Windows; this prepends the right
 # directory to PATH *before* sounddevice tries to load them.
 setup_portaudio_path()
+# Same idea for the CUDA libraries GPU onboarding pip-installs: ctranslate2
+# can't find them on its own, and a CUDA model without them hangs (issue #15).
+setup_nvidia_dll_path()
 
 import argparse
 import logging
@@ -143,6 +146,7 @@ def setup_audio_recorder(audio_config, state_manager, vad_manager, streaming_man
         on_streaming_result=state_manager.handle_streaming_result,
         device=audio_config['input_device'],
         noise_suppression_config=audio_config.get('noise_suppression') or {},
+        whisper_mode_config=audio_config.get('whisper_mode') or {},
     )
 
 def setup_vad(vad_config):
@@ -290,8 +294,19 @@ def setup_hotkey_listener(hotkey_config, state_manager, voice_commands_enabled=T
         rephrase_hotkey=hotkey_config.get('rephrase_hotkey'),
         pause_hotkey=hotkey_config.get('pause_hotkey'),
         transforms_manager=getattr(state_manager, 'transforms_manager', None),
-        recording_mode=hotkey_config.get('recording_mode', 'push_to_talk')
+        recording_mode=hotkey_config.get('recording_mode', 'push_to_talk'),
+        paste_last_hotkey=hotkey_config.get('paste_last_hotkey'),
+        double_tap_to_lock=bool(hotkey_config.get('double_tap_to_lock', False)),
+        double_tap_window_ms=_int_setting(hotkey_config.get('double_tap_window_ms'), 400),
     )
+
+# A numeric setting from hand-edited YAML, falling back to `default` rather
+# than crashing startup over a typo.
+def _int_setting(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 def shutdown_app(hotkey_listener: HotkeyListener, state_manager: StateManager, logger: logging.Logger):
     try:
@@ -344,6 +359,10 @@ def main():
     parser.add_argument('--list-dictionary', action='store_true', help='Show all words in your hotwords dictionary')
     parser.add_argument('--settings', action='store_true', help='Open the settings window')
     parser.add_argument('--history', action='store_true', help='Browse transcript history')
+    # Internal: how window_launcher opens a Tk window in its own process where Tk
+    # must own the main thread (macOS). Not meant to be typed by users.
+    parser.add_argument('--window', choices=('cheat-sheet', 'add-word', 'fallback', 'history'),
+                        help=argparse.SUPPRESS)
     parser.add_argument('--enable-autostart', action='store_true', help='Launch Whisper Local automatically at login')
     parser.add_argument('--disable-autostart', action='store_true', help='Stop launching at login')
     parser.add_argument('--selftest', action='store_true', help='Run automated self-test (mic, model, transcription, clipboard)')
@@ -430,6 +449,10 @@ def main():
         from .dictionary import show_dictionary
         sys.exit(show_dictionary())
 
+    if args.window:
+        from .window_launcher import run_window
+        sys.exit(run_window(args.window, sys.stdin))
+
     if args.settings:
         from .settings_ui import run_settings_window
         run_settings_window()
@@ -437,9 +460,14 @@ def main():
 
     if args.history:
         from .history_window import show_history
-        show_history()
-        import time
-        time.sleep(0.5)
+        from .utils import tk_requires_main_thread
+        # Wait for the window to close. It runs on a daemon thread, so exiting
+        # here would kill it on the spot — the window opened and vanished
+        # immediately when launched from the tray (issue #10). On macOS Tk must
+        # own the main thread, so there it runs right here instead.
+        window = show_history(blocking=tk_requires_main_thread())
+        if window:
+            window.join()
         sys.exit(0)
 
     if args.enable_autostart:
@@ -462,9 +490,11 @@ def main():
 
     if args.cheat_sheet:
         from .cheat_sheet import show_cheat_sheet
-        show_cheat_sheet()
-        import time
-        time.sleep(0.5)
+        from .utils import tk_requires_main_thread
+        # Same daemon-thread trap (and macOS main-thread rule) as --history above.
+        window = show_cheat_sheet(blocking=tk_requires_main_thread())
+        if window:
+            window.join()
         sys.exit(0)
 
     if args.bundle_logs is not None:
@@ -606,8 +636,11 @@ def main():
             from .first_run import is_first_run, show_welcome_window
             from .utils import beautify_hotkey
             if is_first_run():
+                # Blocks here on macOS, where Tk must own the main thread for
+                # as long as the window is open (issue #14).
                 show_welcome_window(
                     hotkey_label=beautify_hotkey(hotkey_config.get('recording_hotkey', 'ctrl+win')),
+                    shutdown_event=shutdown_event,
                 )
         except Exception as e:
             logger.debug(f"First-run welcome skipped: {e}")

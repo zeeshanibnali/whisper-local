@@ -1,6 +1,6 @@
 Local faster-whisper speech-to-text app with global hotkeys for Windows 10+ and macOS
 
-Open-source fork of [PinW/whisper-key-local](https://github.com/PinW/whisper-key-local), maintained as `drajb/whisper-local` by Rohit Burani. Internal Python module name remains `whisper_key`; the config directory remains `%APPDATA%\whisperkey` (`~/.whisperkey` on macOS).
+Open-source project maintained as `drajb/whisper-local` by Rohit Burani. Internal Python module name remains `whisper_key`; the config directory remains `%APPDATA%\whisperkey` (`~/.whisperkey` on macOS).
 
 - Start here: `state_manager.py` coordinates all components workflow
 
@@ -33,6 +33,7 @@ Open-source fork of [PinW/whisper-key-local](https://github.com/PinW/whisper-key
 | **Settings GUI** | `settings_ui.py` | `--settings` Tkinter settings editor with search | tkinter |
 | **Transcript History** | `history_window.py` + `transcript_log.py` | `--history` searchable journal of past transcriptions | tkinter, json |
 | **Hotkey Cheat Sheet** | `cheat_sheet.py` | Window listing currently configured hotkeys | tkinter |
+| **Window Launcher** | `window_launcher.py` | Opens Tk windows in a child process where Tk needs the main thread (macOS) | subprocess, json |
 | **First-Run Welcome** | `first_run.py` | One-time onboarding window on first launch | tkinter |
 | **Terminal Title** | `terminal_title.py` | Animated terminal tab title reflecting app state | - |
 | **Level Overlay** | `level_overlay.py` | Floating level meter + streaming text pill | tkinter |
@@ -41,7 +42,13 @@ Open-source fork of [PinW/whisper-key-local](https://github.com/PinW/whisper-key
 | **Dictionary** | `dictionary.py` | Hotword add/remove/list + add-word dialog | tkinter, ruamel.yaml |
 | **Profiles** | `profiles.py` | Dictation/Chat/Code/Notes/Translate presets | ruamel.yaml |
 | **Per-App Rules** | `app_rules.py` | Foreground-app-specific behaviour overrides | ruamel.yaml |
+| **Layered Defaults** | `defaults_merge.py` | Loads shipped defaults under the user's app_rules/commands/transforms/profiles, and migrates pre-0.21 full copies | ruamel.yaml |
 | **Text Post-Process** | `text_postprocess.py` | Inline formatting, smart formatting, voice editing, corrections + optional Ollama polish | urllib |
+| **Dictation Cleanup** | `dictation_cleanup.py` | Backtrack ("actually 3"), stutter removal, spoken lists, lowercase | re |
+| **Snippets** | `snippets.py` | Spoken shortcuts expanded inline during dictation | re |
+| **Styles** | `styles.py` | Named writing styles (formal/casual/very casual/verbatim), global or per app | - |
+| **Hotkey Gestures** | `hotkey_gestures.py` | Double-tap-to-lock state machine for push-to-talk | threading |
+| **Whisper Mode** | `audio_gain.py` | Boosts quiet recordings before transcription | numpy |
 | **Corrections** | `corrections.py` | Persist post-transcription replacements (history "Fix this everywhere") | ruamel.yaml |
 | **System Audio** | `system_audio.py` | `--transcribe-system` loopback capture (experimental, opt-in) | soundcard |
 | **Streaming** | `streaming_manager.py` + `streaming_recognizer.py` | Real-time partial transcription (experimental) | sherpa-onnx |

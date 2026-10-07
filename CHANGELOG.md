@@ -1,6 +1,201 @@
 # Changelog
 
-History inherited from upstream [`whisper-key-local`](https://github.com/PinW/whisper-key-local). Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.21.0]
+
+### Changed
+- **Your shipped rules, commands, transforms and profiles now keep updating.**
+  Each of these four files used to be copied out of the app once, on first
+  launch, and never touched again, so every later improvement reached new
+  installs only. A machine set up in May still had May's rules eleven releases
+  later. The shipped entries now load from the app every time, and your file
+  holds only what's yours.
+
+  Your file is rewritten once, on the first launch after updating, and the
+  original is kept beside it as `<name>.yaml.<date>.bak`. Entries you never
+  edited are dropped, because the app supplies them now. Entries you did edit
+  become an override that records only the keys you changed, so the rest keeps
+  following the shipped version. Anything with no shipped counterpart is yours
+  and is left alone.
+
+  In `app_rules.yaml`, `commands.yaml`, `transforms.yaml` and `profiles.yaml`
+  you can now:
+  ```yaml
+  rules:
+    - match: ["obsidian.exe"]   # your own, matched before any shipped rule
+      style: casual
+    - id: chat-apps             # change a shipped one, only the keys you list
+      auto_send: false
+    - id: terminals             # or turn it off
+      disabled: true
+  ```
+  Shipped app rules are named by `id`; commands by their `trigger`, transforms
+  and profiles by their `name`.
+
+### Fixed
+- **A code editor showing a file called `slack_bot.py` auto-sent your
+  dictation.** Window titles match by substring, so the chat rule caught it.
+  0.20.0 fixed the shipped rule order, but that fix could only reach people
+  installing for the first time. It now reaches everyone.
+- **Existing installs never got the per-app writing styles** added in 0.20.0,
+  the email rule, or the four voice commands added since. All of them arrive
+  with this release.
+- **A voice command override can swap the action it came with.** Setting
+  `hotkey: null` and adding `type:` now works; the dispatcher tested for the
+  key being present rather than having a value, so a cleared action still fired.
+- **`--doctor` reported the size of your overrides file**, which would have read
+  as "0 rules" while five were in force. It now reports what is actually in
+  effect, and how many of those are yours.
+
+## [0.20.0]
+
+Wispr Flow–style editing, fully offline, plus fixes for both issues reported
+on 0.19.0. Every new feature is off by default except the paste-last hotkey
+and the per-app styles in the shipped app rules.
+
+### Added
+- **Backtrack.** Correct yourself mid-sentence: "let's meet at 2, actually 3"
+  types "let's meet at 3", and "Tuesday, no wait, Wednesday" types
+  "Wednesday". It acts only when a cue ("actually", "I mean", "no wait",
+  "sorry", "make that", …) is followed by a number, time, weekday or month that
+  replaces an earlier one in the same sentence, so "I actually like it" is
+  never touched. Deterministic, no LLM. (`postprocess.backtrack`)
+- **Stutter removal.** "I I think" becomes "I think". Genuine doubles ("had
+  had") and emphasis ("very very") are kept. (`postprocess.remove_repeated_words`)
+- **Spoken lists.** "first, milk. second, eggs" becomes a numbered (or
+  bulleted) list on separate lines. It fires only on markers counting up from
+  one, each followed by punctuation, so "one of the two options" stays prose.
+  (`postprocess.list_formatting`, `list_style`)
+- **Snippets.** Say a trigger such as "my signature" anywhere in normal
+  dictation and its expansion is typed, with `${date}`, `${time}` and
+  `${clipboard}` filled in. `mode: alone` limits a snippet to dictations that
+  are only the trigger. (`postprocess.snippets`)
+- **Writing styles.** `formal`, `casual`, `very_casual` (all lowercase except
+  acronyms and your own terms) and `verbatim` bundle the formatting toggles
+  into one choice. Set one globally (`postprocess.style`) or per app
+  (`style:` in `app_rules.yaml`), or define your own under `postprocess.styles`.
+  The shipped rules now make email formal, chat casual, and code editors and
+  terminals verbatim.
+- **Paste last dictation.** `Alt+Shift+Z` (`Ctrl+Option+V` on macOS) types
+  your last dictation again, e.g. after it landed in the wrong window. It waits
+  until you let go of the keys, so held modifiers can't merge into the paste,
+  and it never presses Enter. App rules still apply: nothing is pasted into a
+  password manager, and copy-only apps like terminals get the clipboard
+  instead. (`hotkey.paste_last_hotkey`)
+- **Hands-free lock.** In push-to-talk mode, double-tap the record hotkey to
+  keep recording without holding it, and tap once more (or press the stop key)
+  to stop. A normal hold works as before. (`hotkey.double_tap_to_lock`)
+- **Whisper mode.** Boosts quiet recordings before transcription so you can
+  dictate under your breath. It only ever raises the volume, capped, and
+  leaves silence alone. (`audio.whisper_mode`)
+- The new options are in the Settings window, the hotkey cheat sheet and the
+  startup hints.
+- **`--doctor` checks the CUDA libraries** when `device: cuda` is configured.
+  Before, it reported "All checks passed" on a machine that could not transcribe.
+
+### Fixed
+- **macOS: the app aborted on every launch (exit 134)**
+  ([#14](https://github.com/drajb/whisper-local/issues/14), @rusifele). Startup
+  created the shared `NSApplication` through pyobjc before any Tk window
+  existed. Tk 9 installs its own subclass, `TKApplication`, only when it gets
+  there first, and its drawing code calls selectors that exist only on that
+  subclass. So when the level overlay built its window, Tk sent `-macOSVersion`
+  to a plain `NSApplication` and the resulting `NSException` killed the process.
+  That isn't a Python exception, so the overlay's `try`/`except` couldn't catch
+  it and the log just stopped. Tk now creates the shared application first,
+  through a hidden root kept for the life of the process. Tk windows on macOS
+  also have to live on the main thread, which the menu-bar loop already owns, so
+  the level overlay is off on macOS for now. The first-run welcome window runs on
+  the main thread there, closes with `quit()` before `destroy()` (with the hidden
+  root alive, `destroy()` alone would have hung every first launch), and closes
+  when the app is asked to quit, where SIGTERM used to be swallowed.
+- **NVIDIA GPU: transcription hung at "Transcribing…"**
+  ([#15](https://github.com/drajb/whisper-local/issues/15), @stusona, diagnosed
+  by @mav8557). Two bugs. First, the GPU check only asked CTranslate2 whether
+  CUDA was supported, which the driver alone answers yes to, so onboarding
+  switched the app to CUDA on machines with no cuBLAS or cuDNN at all. Those
+  libraries load lazily on the first transcription, which then hung. The check
+  now also loads `cublas64_12`, `cublasLt64_12`, `cudnn64_9`, `cudnn_ops64_9` and
+  `cudnn_cnn64_9`, and offers to install them if any are missing. Second, the
+  CUDA libraries onboarding pip-installs land in `site-packages\nvidia\*\bin`,
+  which is on no DLL search path. Installing them did nothing until they were
+  copied by hand into CTranslate2's folder. Those folders are now registered at
+  startup.
+  Configs already set to `device: cuda` without the libraries now stop at launch
+  with a message naming what is missing, and offer to re-run GPU setup or use
+  the CPU, instead of hanging on the first dictation. On windowless launches
+  (autostart), where nobody can answer that prompt, the app uses the CPU for
+  that session.
+- **macOS: the fallback window, hotkey cheat sheet and add-word dialog could
+  never open** (follow-through on
+  [#14](https://github.com/drajb/whisper-local/issues/14)). Each built its Tk
+  window on a background thread, which macOS doesn't allow. They now open in a
+  small child process where Tk has the main thread to itself. A dictated
+  transcript is handed over through a pipe, never on the command line. The
+  `--history` and `--cheat-sheet` commands run their window on the main thread.
+  Nothing changes on Windows.
+
+### Changed
+- The shipped per-app rules use named styles instead of individual toggles, and
+  the specific app rules (password managers, terminals, code editors) now come
+  before the chat and email rules. Title matching is by substring, so a code
+  editor showing `slack_bot.py` used to match the chat rule and auto-send.
+  Existing `app_rules.yaml` files are left as they are.
+- Custom `postprocess.corrections` entries are no longer dropped when a setting
+  is saved from the Settings window or the tray.
+- `no` / `off` in the post-processing settings now mean off. YAML 1.2 reads
+  them as text, which Python treated as "on".
+
+## [0.19.0]
+
+Everything reported by users on 0.18.3.
+
+### Fixed
+- **macOS 27: the app died on the first recording**
+  ([#13](https://github.com/drajb/whisper-local/issues/13), @rusifele). Cocoa has
+  always required AppKit to be touched from the main thread; through macOS 26 a
+  background-thread menu-bar write only logged a warning, and macOS 27 turned it
+  into a hard `SIGTRAP`. The tray was written from two worker threads — the
+  recording thread swapping the icon and menu, and the level monitor rewriting
+  the title every 150 ms — so pressing the hotkey killed the process outright,
+  with nothing in the log. `SIGTRAP` is not a Python exception, which is why the
+  `try`/`except` around every tray write could never have caught it.
+  All tray writes now go through a platform `run_on_ui_thread()`, which
+  dispatches to the main queue on macOS and calls straight through on Windows.
+- **Filler-word stripping destroyed line and paragraph breaks**
+  ([#9](https://github.com/drajb/whisper-local/issues/9), @Eevoo). With
+  `strip_filler_words: true`, the `\n` and `\n\n` that inline formatting had
+  just inserted were flattened into ordinary spaces, so "new paragraph" silently
+  did nothing. Two causes, both fixed: the filler pattern's trailing `\s*` ate
+  the following newlines, and a blanket `\s{2,}` collapse then flattened any
+  that survived. Both are now restricted to spaces and tabs. Output is
+  byte-identical with stripping on or off apart from the filler words themselves.
+- **Transcript history closed the instant it opened**
+  ([#10](https://github.com/drajb/whisper-local/issues/10), @ForrestOfBarnes).
+  `--history` started the window on a daemon thread, slept half a second, then
+  exited — and exiting kills daemon threads. The window really did appear and
+  vanish. It now waits for the window to close. `--cheat-sheet` had the identical
+  bug and is fixed too.
+- **Clipboard-free dictation still touched the clipboard**
+  ([#12](https://github.com/drajb/whisper-local/issues/12), @explorerzkb). With
+  `delivery_method: type` and `type_also_copy_to_clipboard: false`, the two
+  recovery paths (app-rule suppression, and no focused text field) copied anyway,
+  and the popup copied a second time. Both now honour the setting.
+  Those copies existed so the transcript could not be lost, so rather than just
+  removing them, the text is surfaced in the recovery window — which holds it and
+  offers an explicit Copy button. Privacy fixed without trading it for data loss.
+
+### Changed
+- **A per-app rule turning off auto-paste now says so**
+  ([#11](https://github.com/drajb/whisper-local/issues/11), @ForrestOfBarnes,
+  diagnosed by @Syncriix). Dictating into VS Code copies instead of pasting —
+  that is the shipped code-editor rule working as intended, so nothing types into
+  source unexpectedly — but nothing said so, and it reads as a broken app. The
+  first time a rule makes delivery copy-only for an app, a notification explains
+  it and points at `app_rules.yaml`. Once per rule per session, not once per
+  dictation. The settings checkbox and the config comment now mention that
+  per-app rules can override the global setting.
 
 ## [0.18.3]
 
@@ -74,10 +269,9 @@ All three open issues, reported with diagnoses and patches by
 
 ## [0.18.0]
 
-Merges the good ideas from upstream [`PinW/whisper-key-local`](https://github.com/PinW/whisper-key-local)
-(v0.8.2) into this fork. Nothing from this fork was given up to do it — where
-both projects had solved the same problem, both approaches are kept and each is
-used where it is genuinely better.
+Merges a round of outside improvements. Nothing existing was given up to do it —
+where two approaches solved the same problem, both are kept and each is used
+where it is genuinely better.
 
 ### Added
 - **Startup "ready" chime** (`audio_feedback.ready_enabled`, on by default). A
@@ -377,7 +571,6 @@ used where it is genuinely better.
 
 ### Changed
 - Repositioned README for open-source / privacy-first audience; expanded SEO and comparison tables (Wispr Flow, Dragon, Otter, WSR).
-- LICENSE credits both Pin Wang (upstream author) and Rohit Burani (fork maintainer).
 
 ## [0.9.0] - 2026-05-11 (drajb/whisper-local fork)
 
